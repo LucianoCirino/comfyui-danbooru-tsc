@@ -1,0 +1,11 @@
+credentials.json
+danbooru.db
+danbooru.db-shm
+danbooru.db-wal
+__pycache__/
+*.pyc
+_smoketest_*.py
+_probe_*.py
+_verify_*.py
+_api_probe.py
+.claude/
