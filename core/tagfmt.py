@@ -31,3 +31,18 @@ def to_display_tag(tag: str) -> str:
     if _HAS_WORDY.search(s):
         return s.replace("_", " ")
     return s
+
+
+def split_character_trigger(trigger: str) -> tuple[str, str]:
+    """Split a character `trigger` from the DB into (character_display, series_display).
+
+    The CSV stores trigger as e.g. ``"hatsune miku, vocaloid"`` — first chunk
+    is the character display name, second is the series. Returns ("", "") if
+    the trigger is empty, or (name, "") if there is no series segment.
+    """
+    if not trigger:
+        return "", ""
+    parts = [p.strip() for p in trigger.split(",", 1)]
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], parts[1]

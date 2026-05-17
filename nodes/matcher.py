@@ -11,6 +11,7 @@ import re
 import time
 
 from ..core import db as dblayer
+from ..core.tagfmt import split_character_trigger
 
 
 class DanbooruCharacterMatcher:
@@ -48,8 +49,8 @@ class DanbooruCharacterMatcher:
             }
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "STRING", "INT", "FLOAT", "STRING")
-    RETURN_NAMES = ("trigger", "core_tags", "matched_tags", "match_count", "probability_%", "debug_info")
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("character_triggers", "character_series", "character_core_tags", "debug_info")
     FUNCTION = "match_character"
     CATEGORY = "🎨 danbooru-tsc"
 
@@ -171,14 +172,16 @@ class DanbooruCharacterMatcher:
             remaining_prob = sum((m["weight"] / total_weight) * 100 for m in sorted_matches[20:])
             debug_lines.append(f"\n... and {len(matches) - 20} more candidates ({remaining_prob:.1f}% combined)")
 
+        # Split the DB trigger ("hatsune miku, vocaloid") into name + series so
+        # the matcher's outputs line up with the extractor's shape.
+        char_disp, series_disp = split_character_trigger(selected["trigger"] or "")
+
         return (
-            selected["trigger"],
-            selected["core_tags"],
-            matched_tags_str,
-            selected["match_count"],
-            round(selection_prob, 2),
+            char_disp,
+            series_disp,
+            selected["core_tags"] or "",
             "\n".join(debug_lines),
         )
 
     def _no_match(self, reason):
-        return ("no_match", "", reason, 0, 0.0, f"No match: {reason}")
+        return ("", "", "", f"No match: {reason}")
