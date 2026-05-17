@@ -1,15 +1,15 @@
 """DanbooruAgent: a single ComfyUI node that orchestrates an LLM tool-call
 loop against a local llama.cpp server.
 
-Input: a free-text user request like "an anime image of miku in the style of
-ebifurya, blue dress, sitting on a bench".
+Input: a free-text user request like "miku and rin in the style of ebifurya".
 
-The node hands the request to the LLM along with four search/lookup tools and
-one terminal tool, `submit_answer`. The LLM searches the danbooru CSV-backed
-database, picks the best matching character + artist, and submits a structured
-answer. The node then re-looks-up the chosen keys against the DB so the final
-trigger / core_tags strings are guaranteed correct (the LLM never has to copy
-them by hand).
+The node hands the request to the LLM along with the character/artist
+search+lookup tools and one terminal tool, `submit_answer`. The LLM resolves
+the request into a list of danbooru character keys (zero or more) and at
+most one artist key. The node then re-looks-up each chosen key against the
+DB so the final trigger / series / core_tags strings are guaranteed correct
+(the LLM never copies them by hand). Generic descriptive tags are NOT this
+node's job — a downstream tag-refiner handles those.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ import urllib.request
 from ..core import db as dblayer
 from ..core import search as searchmod
 from ..core import prompts as promptlib
+from ..core.tagfmt import to_display_tag
 
 
 # ---------------------------------------------------------------------------
@@ -34,28 +35,30 @@ SUBMIT_ANSWER_SPEC = {
         "name": "submit_answer",
         "description": (
             "Call this exactly once when you have settled on the best matches. "
-            "Pass the danbooru character key (or empty if no character was "
-            "implied), the danbooru artist key (or empty if no artist was "
-            "implied), and any extra danbooru-style tags from the user's "
-            "request that aren't already covered by the character or artist."
+            "Pass the list of danbooru character keys the user implied (empty "
+            "list if none) and the single danbooru artist key (empty string "
+            "if none). Do NOT include generic descriptive tags — they are "
+            "handled by a different node downstream."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "character": {
-                    "type": "string",
-                    "description": "Exact danbooru character key, e.g. 'hatsune_miku'. Empty string if none.",
+                "characters": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Exact danbooru character keys the user named or "
+                        "clearly implied, e.g. ['hatsune_miku', 'kagamine_rin']. "
+                        "Use an empty list [] if the user did not name any "
+                        "character — empty is the correct answer in that case."
+                    ),
                 },
                 "artist": {
                     "type": "string",
-                    "description": "Exact danbooru artist key, e.g. 'ebifurya'. Empty string if none.",
-                },
-                "extra_tags": {
-                    "type": "string",
                     "description": (
-                        "Comma-separated extra danbooru tags from the user's "
-                        "request, e.g. 'sitting, blue dress, looking at viewer'. "
-                        "Empty string if none."
+                        "Exact danbooru artist key, e.g. 'ebifurya'. Empty "
+                        "string if the user did not name an artist or style — "
+                        "empty is the correct answer in that case."
                     ),
                 },
                 "reasoning": {
@@ -63,7 +66,7 @@ SUBMIT_ANSWER_SPEC = {
                     "description": "One short sentence explaining the choice. Optional.",
                 },
             },
-            "required": ["character", "artist", "extra_tags"],
+            "required": ["characters", "artist"],
         },
     },
 }
@@ -221,9 +224,51 @@ def run_agent(host: str,
 # ComfyUI node
 # ---------------------------------------------------------------------------
 
+def _normalize_character_keys(submitted: dict) -> list[str]:
+    """Pull a clean list of character keys out of a submit_answer payload.
+
+    Accepts the canonical `characters: []` shape; also tolerates a legacy
+    `character: ""` field or a stringified list, in case a small model regresses.
+    """
+    keys: list[str] = []
+    raw = submitted.get("characters")
+    if isinstance(raw, list):
+        keys = [str(x).strip() for x in raw if str(x).strip()]
+    elif isinstance(raw, str) and raw.strip():
+        # Model handed us a string instead of a list — accept comma-separated.
+        keys = [t.strip() for t in raw.split(",") if t.strip()]
+    legacy = submitted.get("character")
+    if isinstance(legacy, str) and legacy.strip() and not keys:
+        keys = [legacy.strip()]
+    # Dedupe while preserving order.
+    seen: set[str] = set()
+    out: list[str] = []
+    for k in keys:
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+def _split_character_trigger(trigger: str) -> tuple[str, str]:
+    """Split a character `trigger` string into (character_display, series_display).
+
+    The CSV stores trigger as e.g. ``"hatsune miku, vocaloid"`` — first chunk
+    is the character display name, second is the series. Returns ("", "") if
+    the trigger is empty.
+    """
+    if not trigger:
+        return "", ""
+    parts = [p.strip() for p in trigger.split(",", 1)]
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], parts[1]
+
+
 class DanbooruAgent:
-    """Run an LLM agent with danbooru search tools to resolve a free-text
-    request into a (character, artist, extra_tags) tuple."""
+    """LLM agent that extracts danbooru character keys (zero or more) and an
+    optional artist key from a free-text request. Generic descriptive tags are
+    deliberately out of scope — a downstream tag-refiner handles those."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -231,7 +276,7 @@ class DanbooruAgent:
             "required": {
                 "model": ("LLAMACPP_MODEL",),
                 "user_request": ("STRING", {
-                    "default": "an anime image of hatsune miku in the style of ebifurya",
+                    "default": "hatsune miku and kagamine rin in the style of ebifurya",
                     "multiline": True,
                 }),
             },
@@ -269,13 +314,12 @@ class DanbooruAgent:
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING", "STRING")
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING")
     RETURN_NAMES = (
-        "character_trigger",
+        "character_triggers",
+        "character_series",
         "character_core_tags",
         "artist_trigger",
-        "extra_tags",
-        "combined_prompt",
         "debug_info",
     )
     FUNCTION = "run"
@@ -293,7 +337,7 @@ class DanbooruAgent:
                 "Add a 'Danbooru DB Build' node and run it once, "
                 "or run build_db.py from the pack folder."
             )
-            return ("", "", "", "", "", err)
+            return ("", "", "", "", err)
 
         if isinstance(model, dict):
             host = model.get("host", "localhost")
@@ -304,7 +348,7 @@ class DanbooruAgent:
         if not _server_alive(host, port):
             err = (f"llama.cpp server not reachable at {host}:{port}. "
                    "Add a LlamaCpp Load Model or LlamaCpp External Server node first.")
-            return ("", "", "", "", "", err)
+            return ("", "", "", "", err)
 
         start = time.time()
         submitted, transcript = run_agent(
@@ -326,44 +370,76 @@ class DanbooruAgent:
         elapsed = time.time() - start
 
         # Resolve final triggers via authoritative DB lookup, not by trusting
-        # whatever string the model copied back.
-        character_trigger = ""
-        character_core_tags = ""
-        artist_trigger = ""
-        extra_tags = ""
-        chosen_char_key = ""
+        # whatever strings the model copied back. Per-character outputs use
+        # newline as the inter-character boundary so downstream consumers can
+        # tell where one character's tags end and the next begins; CLIP text
+        # encoders treat newlines as whitespace so a single-CLIP workflow
+        # still "just works". Series is comma-joined and deduped because
+        # it's scene-level context, not per-character.
+        chosen_char_keys: list[str] = []
         chosen_art_key = ""
+        char_triggers: list[str] = []
+        char_series: list[str] = []
+        char_core_tags: list[str] = []
+        artist_trigger = ""
+        resolved_char_rows: list[tuple[str, dict | None]] = []
 
         if submitted:
-            chosen_char_key = (submitted.get("character") or "").strip()
+            chosen_char_keys = _normalize_character_keys(submitted)
             chosen_art_key = (submitted.get("artist") or "").strip()
-            extra_tags = (submitted.get("extra_tags") or "").strip()
 
-            if chosen_char_key:
-                row = searchmod.lookup_character(chosen_char_key)
-                if row:
-                    character_trigger = row["trigger"] or ""
-                    character_core_tags = row["core_tags"] or ""
+            seen_series: set[str] = set()
+            for key in chosen_char_keys:
+                row = searchmod.lookup_character(key)
+                resolved_char_rows.append((key, row))
+                if not row:
+                    continue
+                char_disp, series_disp = _split_character_trigger(row.get("trigger") or "")
+                # Fall back to deriving display names from the keys if the
+                # trigger field was missing/oddly shaped.
+                if not char_disp:
+                    char_disp = to_display_tag(row.get("character") or key)
+                if not series_disp and row.get("copyright"):
+                    series_disp = to_display_tag(row["copyright"])
+                if char_disp:
+                    char_triggers.append(char_disp)
+                if series_disp and series_disp not in seen_series:
+                    seen_series.add(series_disp)
+                    char_series.append(series_disp)
+                core = (row.get("core_tags") or "").strip()
+                if core:
+                    char_core_tags.append(core)
+
             if chosen_art_key:
-                row = searchmod.lookup_artist(chosen_art_key)
-                if row:
-                    artist_trigger = row["trigger"] or ""
+                arow = searchmod.lookup_artist(chosen_art_key)
+                if arow:
+                    artist_trigger = arow.get("trigger") or ""
 
-        # Compose a combined prompt the user can wire straight into a CLIP node.
-        parts = [p for p in (character_trigger, character_core_tags, extra_tags, artist_trigger) if p]
-        combined_prompt = ", ".join(parts)
+        # Per-character lines separated by '\n'. For 1 character there is no
+        # newline, so single-char workflows look identical to before.
+        character_triggers = "\n".join(char_triggers)
+        character_core_tags = "\n".join(char_core_tags)
+        # Series is scene-level — comma-join and dedup is what you want.
+        character_series = ", ".join(char_series)
 
         # Debug info
         lines = [
             f"=== DanbooruAgent ({elapsed:.1f}s, {len(transcript)} turns) ===",
             f"server: {host}:{port}",
             f"submitted: {submitted}",
-            f"resolved character: '{chosen_char_key}' -> trigger='{character_trigger}'",
-            f"resolved artist:    '{chosen_art_key}' -> trigger='{artist_trigger}'",
-            f"extra_tags: '{extra_tags}'",
-            "",
-            "--- transcript ---",
+            f"resolved characters ({len(chosen_char_keys)}):",
         ]
+        if not chosen_char_keys:
+            lines.append("  (none — agent returned empty character list)")
+        for key, row in resolved_char_rows:
+            if row:
+                disp, series = _split_character_trigger(row.get("trigger") or "")
+                lines.append(f"  '{key}' -> '{disp}' (series='{series}')")
+            else:
+                lines.append(f"  '{key}' -> NOT FOUND in DB")
+        lines.append(f"resolved artist:    '{chosen_art_key}' -> trigger='{artist_trigger}'")
+        lines.append("")
+        lines.append("--- transcript ---")
         for i, turn in enumerate(transcript):
             if "error" in turn:
                 lines.append(f"[{i}] ERROR: {turn['error']}")
@@ -386,10 +462,9 @@ class DanbooruAgent:
         debug_info = "\n".join(lines)
 
         return (
-            character_trigger,
+            character_triggers,
+            character_series,
             character_core_tags,
             artist_trigger,
-            extra_tags,
-            combined_prompt,
             debug_info,
         )
