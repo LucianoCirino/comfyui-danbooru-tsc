@@ -303,7 +303,7 @@ class DanbooruTagRefiner:
                     ),
                 }),
                 "max_iterations": ("INT", {"default": 6, "min": 1, "max": 20}),
-                "temperature": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "temperature": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "max_tokens": ("INT", {"default": 1024, "min": 64, "max": 32768}),
                 "seed": ("INT", {"default": -1, "min": -1, "max": 0xffffffffffffffff}),
                 "top_p": ("FLOAT", {
@@ -319,12 +319,12 @@ class DanbooruTagRefiner:
                     "tooltip": "Min-p sampling cutoff. -1 = use server default. Qwen3 recommended: 0.0.",
                 }),
                 "presence_penalty": ("FLOAT", {
-                    "default": 0.0, "min": -2.0, "max": 2.0, "step": 0.05,
-                    "tooltip": "Penalty for tokens already present in the output. 0 = no penalty (OpenAI default). Always sent — overrides any server CLI flag.",
+                    "default": 1.0, "min": -2.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "Penalty for tokens already present in the output. Always sent — overrides any server CLI flag. 0 = off. Qwen3 team suggests 1.0-1.5 for non-thinking to reduce repetition; refiner default 1.0.",
                 }),
                 "repeat_penalty": ("FLOAT", {
-                    "default": -1.0, "min": -1.0, "max": 2.0, "step": 0.05,
-                    "tooltip": "llama.cpp n-gram repetition penalty. -1 = use server default. Typical: 1.1 (1.0 = off).",
+                    "default": 1.05, "min": -1.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "llama.cpp n-gram repetition penalty. -1 = use server default. 1.0 = off (most server defaults). Refiner default 1.05 — light anti-repeat to prevent duplicate tags without distorting Anima ordering.",
                 }),
                 "timeout": ("INT", {"default": 120, "min": 10, "max": 600}),
                 "debug": ("BOOLEAN", {"default": False}),
@@ -337,9 +337,9 @@ class DanbooruTagRefiner:
     CATEGORY = "🎨 danbooru-tsc"
 
     def run(self, model, enhanced_prose, danbot_tags, mode,
-            character_context="", max_iterations=6, temperature=0.3,
+            character_context="", max_iterations=6, temperature=0.5,
             max_tokens=1024, seed=-1, top_p=0.8, top_k=20, min_p=0.0,
-            presence_penalty=0.0, repeat_penalty=-1.0,
+            presence_penalty=1.0, repeat_penalty=1.05,
             timeout=120, debug=False):
 
         # Trust mode — no LLM call. Pass the prose through as-is so the
