@@ -110,6 +110,11 @@ def run_agent(host: str,
               seed: int,
               timeout: int,
               debug: bool,
+              top_p: float = 0.8,
+              top_k: int = 20,
+              min_p: float = 0.0,
+              presence_penalty: float = 0.0,
+              repeat_penalty: float = -1.0,
               progress=print):
     """Run the tool-call loop. Returns (submitted_args, transcript).
 
@@ -130,12 +135,21 @@ def run_agent(host: str,
             "tool_choice": "auto",
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "presence_penalty": presence_penalty,
             "stream": False,
             # Disable thinking — we want fast, deterministic tool dispatch
             "chat_template_kwargs": {"enable_thinking": False},
         }
         if seed is not None and seed >= 0:
             body["seed"] = seed + it  # vary slightly across iterations
+        if top_p >= 0:
+            body["top_p"] = top_p
+        if top_k >= 0:
+            body["top_k"] = top_k
+        if min_p >= 0:
+            body["min_p"] = min_p
+        if repeat_penalty >= 0:
+            body["repeat_penalty"] = repeat_penalty
 
         if debug:
             progress(f"[agent] iter {it+1}/{max_iterations} -> POST chat")
@@ -230,6 +244,26 @@ class DanbooruAgent:
                 "temperature": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "max_tokens": ("INT", {"default": 1024, "min": 64, "max": 32768}),
                 "seed": ("INT", {"default": -1, "min": -1, "max": 0xffffffffffffffff}),
+                "top_p": ("FLOAT", {
+                    "default": 0.8, "min": -1.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Nucleus sampling cutoff. -1 = use server default. Qwen3 non-thinking recommended: 0.8.",
+                }),
+                "top_k": ("INT", {
+                    "default": 20, "min": -1, "max": 1000,
+                    "tooltip": "Top-k sampling cutoff. -1 = use server default. Qwen3 recommended: 20.",
+                }),
+                "min_p": ("FLOAT", {
+                    "default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Min-p sampling cutoff. -1 = use server default. Qwen3 recommended: 0.0.",
+                }),
+                "presence_penalty": ("FLOAT", {
+                    "default": 0.0, "min": -2.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "Penalty for tokens already present in the output. 0 = no penalty (OpenAI default). Always sent — overrides any server CLI flag.",
+                }),
+                "repeat_penalty": ("FLOAT", {
+                    "default": -1.0, "min": -1.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "llama.cpp n-gram repetition penalty. -1 = use server default. Typical: 1.1 (1.0 = off).",
+                }),
                 "timeout": ("INT", {"default": 120, "min": 10, "max": 600}),
                 "debug": ("BOOLEAN", {"default": False}),
             },
@@ -249,7 +283,9 @@ class DanbooruAgent:
 
     def run(self, model, user_request, system_prompt=DEFAULT_SYSTEM_PROMPT,
             max_iterations=6, temperature=0.3, max_tokens=1024,
-            seed=-1, timeout=120, debug=False):
+            seed=-1, top_p=0.8, top_k=20, min_p=0.0,
+            presence_penalty=0.0, repeat_penalty=-1.0,
+            timeout=120, debug=False):
 
         if not dblayer.db_exists():
             err = (
@@ -281,6 +317,11 @@ class DanbooruAgent:
             seed=seed,
             timeout=timeout,
             debug=debug,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            presence_penalty=presence_penalty,
+            repeat_penalty=repeat_penalty,
         )
         elapsed = time.time() - start
 
