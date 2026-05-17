@@ -8,6 +8,7 @@ from .nodes.refiner import DanbooruTagRefiner
 from .nodes.composer import AnimaPromptComposer
 from .nodes.sampler import RandomTagSampler
 from .nodes.fast_enhancer import AnimaFastEnhancer
+from .nodes.gelbooru_swap import GelbooruTagSwap
 
 NODE_CLASS_MAPPINGS = {
     "DanbooruAgent_tsc": DanbooruAgent,
@@ -15,6 +16,7 @@ NODE_CLASS_MAPPINGS = {
     "DanbooruTagRefiner_tsc": DanbooruTagRefiner,
     "AnimaPromptComposer_tsc": AnimaPromptComposer,
     "AnimaFastEnhancer_tsc": AnimaFastEnhancer,
+    "GelbooruTagSwap_tsc": GelbooruTagSwap,
     "DanbooruCharacterMatcher_tsc": DanbooruCharacterMatcher,
     "DanbooruRandomImage_tsc": DanbooruRandomImage,
     "DanbooruDBBuild_tsc": DanbooruDBBuild,
@@ -27,6 +29,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DanbooruTagRefiner_tsc":       "🎨 Danbooru Tag Refiner (LLM)",
     "AnimaPromptComposer_tsc":      "🎨 Anima Prompt Composer",
     "AnimaFastEnhancer_tsc":        "🎨 Anima Fast Enhancer (LLM)",
+    "GelbooruTagSwap_tsc":          "🎨 Gelbooru Tag Swap",
     "DanbooruCharacterMatcher_tsc": "🎨 Danbooru Character Matcher",
     "DanbooruRandomImage_tsc":      "🎨 Danbooru Random Image",
     "DanbooruDBBuild_tsc":          "🎨 Danbooru DB Build",
