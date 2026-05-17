@@ -1,15 +1,20 @@
-"""DanbooruTagRefiner: take DanBot's raw tag candidates and refine them with
-an LLM that has tag-search + definition-lookup tools.
+"""DanbooruTagRefiner: weave a natural-language prose description together
+with applicable danbooru tags into one final comma-separated prompt.
+
+The output is a single fluid stream where each comma-separated chunk is
+either a bare tag (scene-level concepts that don't need a subject binding:
+``2girls``, ``standing``, ``sunset``) or a short subject-binding natural-
+language phrase (per-character actions that tags can't anchor: ``miku
+winking``, ``reimu holding a flower``). This matches Anima-family prompt
+conventions: tags + light NL, with NL used only where tags can't bind a
+concept to a specific subject.
 
 Modes:
-  trust              — no LLM call. Just normalize DanBot's tags and pass through.
-  filter             — 1 LLM call, no tools. Drop tags not implied by the prose.
-  filter+search      — LLM with search_tag. Drop bad ones + fill gaps.
-  filter+search+lookup — LLM with search_tag + get_tag_definition. Verify
-                       uncertain ones too. Most thorough.
-
-Output is comma-separated tags in Anima-friendly form: lowercase, spaces
-instead of underscores.
+  trust                — no LLM call. Pass the prose through as-is.
+  weave                — 1 LLM call, no tools. Weave prose+tags.
+  weave+search         — LLM with search_tag. Same plus tag-spelling lookup.
+  weave+search+lookup  — LLM with search_tag + get_tag_definition. Verify
+                         meaning of uncertain tags before weaving them.
 """
 
 from __future__ import annotations
@@ -85,26 +90,31 @@ def _server_alive(host: str, port: int) -> bool:
 SUBMIT_SPEC = {
     "type": "function",
     "function": {
-        "name": "submit_tags",
+        "name": "submit_prompt",
         "description": (
-            "Call this exactly once when you have settled on the final list "
-            "of danbooru tags. Pass them as a comma-separated string in "
-            "lowercase with spaces (not underscores). Don't include the "
-            "character or artist tags — those are handled separately."
+            "Call this exactly once when you have settled on the final "
+            "refined prompt. Pass it as one comma-separated string mixing "
+            "bare danbooru tags with short subject-binding natural-language "
+            "phrases. Lowercase, spaces (not underscores) for tags. Do NOT "
+            "re-emit the listed character core_tags or series — those are "
+            "wired into the final prompt elsewhere."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "tags": {
+                "prompt": {
                     "type": "string",
-                    "description": "Comma-separated tags, e.g. 'sitting on bench, looking at viewer, blue dress, sunset'.",
+                    "description": (
+                        "The final refined prompt. Example: "
+                        "'2girls, standing, miku winking, reimu smiles, sunset'"
+                    ),
                 },
                 "reasoning": {
                     "type": "string",
-                    "description": "One short sentence on what you kept/dropped/added. Optional.",
+                    "description": "One short sentence on the weaving choices. Optional.",
                 },
             },
-            "required": ["tags"],
+            "required": ["prompt"],
         },
     },
 }
@@ -114,13 +124,13 @@ SUBMIT_SPEC = {
 # Mode -> (system prompt, tool list)
 # ---------------------------------------------------------------------------
 
-MODES = ["trust", "filter", "filter+search", "filter+search+lookup"]
+MODES = ["trust", "weave", "weave+search", "weave+search+lookup"]
 
 
 _MODE_PROMPT_NAMES = {
-    "filter":               "tag_refiner_filter",
-    "filter+search":        "tag_refiner_filter_search",
-    "filter+search+lookup": "tag_refiner_filter_search_lookup",
+    "weave":               "tag_refiner_weave",
+    "weave+search":        "tag_refiner_weave_search",
+    "weave+search+lookup": "tag_refiner_weave_search_lookup",
 }
 
 
@@ -129,13 +139,13 @@ def _system_prompt(mode: str) -> str:
 
 
 def _tools(mode: str) -> list[dict]:
-    if mode == "filter":
+    if mode == "weave":
         return [SUBMIT_SPEC]
-    if mode == "filter+search":
+    if mode == "weave+search":
         # search_tag only, plus terminal
         search_only = next(s for s in searchmod.TAG_TOOL_SPECS if s["function"]["name"] == "search_tag")
         return [search_only, SUBMIT_SPEC]
-    # filter+search+lookup
+    # weave+search+lookup
     return list(searchmod.TAG_TOOL_SPECS) + [SUBMIT_SPEC]
 
 
@@ -143,18 +153,24 @@ def _tools(mode: str) -> list[dict]:
 # Loop runner
 # ---------------------------------------------------------------------------
 
-def run_refiner(host, port, mode, prose, danbot_tags, character_core_tags,
+def run_refiner(host, port, mode, prose, danbot_tags, character_context,
                 temperature, max_tokens, max_iterations, seed, timeout, debug,
+                top_p=-1.0, top_k=-1, min_p=-1.0,
+                presence_penalty=0.0, repeat_penalty=-1.0,
                 progress=print):
-    """Returns (final_tag_list, transcript)."""
+    """Returns (final_prompt_string, transcript)."""
     user_msg = (
         f"Description of desired image:\n{prose.strip()}\n\n"
-        f"DanBot's candidate tags:\n{danbot_tags.strip()}"
+        f"DanBot's candidate tags (advisory — may be noisy; verify against the description):\n"
+        f"{danbot_tags.strip()}"
     )
-    if character_core_tags and character_core_tags.strip():
+    if character_context and character_context.strip():
         user_msg += (
-            f"\n\nCharacter's core tags (already included separately — DO NOT repeat):\n"
-            f"{character_core_tags.strip()}"
+            f"\n\nCharacter context (per character: name, series, core_tags — these "
+            f"are ALREADY wired into the final prompt elsewhere; use the names to "
+            f"anchor per-character actions in your output but DO NOT re-emit the "
+            f"listed core_tags or series):\n"
+            f"{character_context.strip()}"
         )
 
     messages = [
@@ -171,11 +187,20 @@ def run_refiner(host, port, mode, prose, danbot_tags, character_core_tags,
             "tool_choice": "auto",
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "presence_penalty": presence_penalty,
             "stream": False,
             "chat_template_kwargs": {"enable_thinking": False},
         }
         if seed is not None and seed >= 0:
             body["seed"] = seed + it
+        if top_p >= 0:
+            body["top_p"] = top_p
+        if top_k >= 0:
+            body["top_k"] = top_k
+        if min_p >= 0:
+            body["min_p"] = min_p
+        if repeat_penalty >= 0:
+            body["repeat_penalty"] = repeat_penalty
 
         if debug:
             progress(f"[refiner:{mode}] iter {it+1}/{max_iterations}")
@@ -214,7 +239,7 @@ def run_refiner(host, port, mode, prose, danbot_tags, character_core_tags,
             except json.JSONDecodeError:
                 args = {}
 
-            if name == "submit_tags":
+            if name == "submit_prompt":
                 submitted = args
                 tool_result = {"status": "received"}
             else:
@@ -233,7 +258,7 @@ def run_refiner(host, port, mode, prose, danbot_tags, character_core_tags,
             transcript.append({"tool": name, "args": args, "result": tool_result})
 
             if submitted is not None:
-                final = parse_tag_list(submitted.get("tags", ""))
+                final = (submitted.get("prompt") or "").strip()
                 return final, transcript
 
     return None, transcript
@@ -244,7 +269,9 @@ def run_refiner(host, port, mode, prose, danbot_tags, character_core_tags,
 # ---------------------------------------------------------------------------
 
 class DanbooruTagRefiner:
-    """Refine DanBot tag candidates using an LLM (or just normalize, in trust mode)."""
+    """Weave a natural-language prose description and applicable danbooru
+    tags into one final hybrid prompt. The output is comma-separated, mixing
+    bare tags with short subject-binding NL phrases — Anima-friendly form."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -252,52 +279,80 @@ class DanbooruTagRefiner:
             "required": {
                 "model": ("LLAMACPP_MODEL",),
                 "enhanced_prose": ("STRING", {
-                    "default": "An anime girl with twintails sitting on a park bench at sunset, holding a bouquet of flowers.",
+                    "default": "Hatsune Miku and Hakurei Reimu standing together. Miku is winking while Reimu smiles.",
                     "multiline": True,
                 }),
                 "danbot_tags": ("STRING", {
-                    "default": "1girl, sitting, bench, twintails, sunset, holding flowers",
+                    "default": "2girls, standing, wink, smile",
                     "multiline": True,
                 }),
-                "mode": (MODES, {"default": "filter+search+lookup"}),
+                "mode": (MODES, {"default": "weave+search"}),
             },
             "optional": {
-                "character_core_tags": ("STRING", {
+                "character_context": ("STRING", {
                     "default": "",
                     "multiline": True,
-                    "tooltip": "Wire from Danbooru Agent so the refiner won't repeat tags already implied by the character.",
+                    "tooltip": (
+                        "Per-character context the LLM uses to anchor per-character actions and "
+                        "skip tags already covered elsewhere. Expected format (one entry per line):\n"
+                        "character_1: name, series, core_tag1, core_tag2, ...\n"
+                        "character_2: name, series, core_tag1, ...\n"
+                        "The refiner will use the names to anchor per-character actions in the "
+                        "output (e.g. 'miku winking') and will NOT re-emit the listed core_tags "
+                        "or series."
+                    ),
                 }),
                 "max_iterations": ("INT", {"default": 6, "min": 1, "max": 20}),
                 "temperature": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "max_tokens": ("INT", {"default": 1024, "min": 64, "max": 32768}),
                 "seed": ("INT", {"default": -1, "min": -1, "max": 0xffffffffffffffff}),
+                "top_p": ("FLOAT", {
+                    "default": 0.8, "min": -1.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Nucleus sampling cutoff. -1 = use server default. Qwen3 non-thinking recommended: 0.8.",
+                }),
+                "top_k": ("INT", {
+                    "default": 20, "min": -1, "max": 1000,
+                    "tooltip": "Top-k sampling cutoff. -1 = use server default. Qwen3 recommended: 20.",
+                }),
+                "min_p": ("FLOAT", {
+                    "default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Min-p sampling cutoff. -1 = use server default. Qwen3 recommended: 0.0.",
+                }),
+                "presence_penalty": ("FLOAT", {
+                    "default": 0.0, "min": -2.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "Penalty for tokens already present in the output. 0 = no penalty (OpenAI default). Always sent — overrides any server CLI flag.",
+                }),
+                "repeat_penalty": ("FLOAT", {
+                    "default": -1.0, "min": -1.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "llama.cpp n-gram repetition penalty. -1 = use server default. Typical: 1.1 (1.0 = off).",
+                }),
                 "timeout": ("INT", {"default": 120, "min": 10, "max": 600}),
                 "debug": ("BOOLEAN", {"default": False}),
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "STRING")
-    RETURN_NAMES = ("refined_tags", "dropped_tags", "debug_info")
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("refined_prompt", "debug_info")
     FUNCTION = "run"
     CATEGORY = "🎨 danbooru-tsc"
 
     def run(self, model, enhanced_prose, danbot_tags, mode,
-            character_core_tags="", max_iterations=6, temperature=0.3,
-            max_tokens=1024, seed=-1, timeout=120, debug=False):
+            character_context="", max_iterations=6, temperature=0.3,
+            max_tokens=1024, seed=-1, top_p=0.8, top_k=20, min_p=0.0,
+            presence_penalty=0.0, repeat_penalty=-1.0,
+            timeout=120, debug=False):
 
-        original = parse_tag_list(danbot_tags)
-
-        # Trust mode — no LLM call
+        # Trust mode — no LLM call. Pass the prose through as-is so the
+        # caller can still wire downstream nodes without an LLM running.
         if mode == "trust":
             return (
-                join_tags(original),
-                "",
-                f"trust mode: passed {len(original)} tags through unchanged",
+                enhanced_prose.strip(),
+                f"trust mode: passed prose through unchanged ({len(enhanced_prose)} chars)",
             )
 
         if not dblayer.db_exists():
             err = f"danbooru.db not found at {dblayer.DB_PATH}. Run 'Danbooru DB Build'."
-            return (join_tags(original), "", err)
+            return (enhanced_prose.strip(), err)
 
         if isinstance(model, dict):
             host = model.get("host", "localhost")
@@ -307,42 +362,37 @@ class DanbooruTagRefiner:
 
         if not _server_alive(host, port):
             err = f"llama.cpp server not reachable at {host}:{port}"
-            return (join_tags(original), "", err)
+            return (enhanced_prose.strip(), err)
 
         start = time.time()
         final, transcript = run_refiner(
             host=host, port=port, mode=mode,
             prose=enhanced_prose, danbot_tags=danbot_tags,
-            character_core_tags=character_core_tags,
+            character_context=character_context,
             temperature=temperature, max_tokens=max_tokens,
             max_iterations=max_iterations, seed=seed, timeout=timeout,
             debug=debug,
+            top_p=top_p, top_k=top_k, min_p=min_p,
+            presence_penalty=presence_penalty, repeat_penalty=repeat_penalty,
         )
         elapsed = time.time() - start
 
-        # Fall back to original if LLM failed to submit
-        if final is None:
-            err = "LLM did not call submit_tags within iteration cap; passing DanBot tags through."
-            return (join_tags(original), "", f"{err}\n\n--- transcript ---\n" + _format_transcript(transcript))
-
-        # Compute dropped: tags in original but not in final
-        final_set = set(final)
-        original_set = set(original)
-        dropped = [t for t in original if t not in final_set]
-        added = [t for t in final if t not in original_set]
+        # Fall back to the original prose if the LLM never called submit_prompt.
+        if final is None or not final.strip():
+            err = "LLM did not call submit_prompt within iteration cap; passing prose through."
+            return (
+                enhanced_prose.strip(),
+                f"{err}\n\n--- transcript ---\n" + _format_transcript(transcript),
+            )
 
         debug_info = (
             f"=== TagRefiner ({mode}, {elapsed:.1f}s, {len(transcript)} turns) ===\n"
-            f"input danbot tags : {len(original)}\n"
-            f"final tags        : {len(final)}\n"
-            f"dropped           : {len(dropped)}\n"
-            f"added             : {len(added)}\n"
-            f"\nfinal: {join_tags(final)}\n"
-            f"dropped: {join_tags(dropped)}\n"
-            f"added: {join_tags(added)}\n"
+            f"prose chars : {len(enhanced_prose)}\n"
+            f"final chars : {len(final)}\n"
+            f"\nrefined_prompt:\n{final}\n"
             f"\n--- transcript ---\n" + _format_transcript(transcript)
         )
-        return (join_tags(final), join_tags(dropped), debug_info)
+        return (final, debug_info)
 
 
 def _format_transcript(transcript):
