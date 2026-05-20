@@ -19,6 +19,15 @@ import re
 
 _HAS_WORDY = re.compile(r"[A-Za-z]{2,}")
 
+# Balanced ``(...)`` group whose opening paren is NOT already escaped.
+# ``[^()]*`` keeps the match flat; danbooru qualifiers are never nested.
+_PAREN_GROUP = re.compile(r"(?<!\\)\(([^()]*)\)")
+
+# An already-escaped ``\(...\)`` region in an in-flight string. Used to
+# carve a partially-rewritten tag into escaped vs. raw segments so we can
+# apply the underscore→space rule ONLY to the raw segments.
+_ESCAPED_REGION = re.compile(r"(\\\([^()]*\\\))")
+
 
 def to_display_tag(tag: str) -> str:
     """Render a DB tag in display/prompt form.
@@ -31,6 +40,44 @@ def to_display_tag(tag: str) -> str:
     if _HAS_WORDY.search(s):
         return s.replace("_", " ")
     return s
+
+
+def escape_for_comfy(tag: str) -> str:
+    """Rewrite a single tag into ComfyUI-prompt-safe display form.
+
+    ComfyUI's prompt parser treats unescaped parens as weight syntax
+    (``(tag:1.2)``). Danbooru qualifiers embed literal parens —
+    ``fate_(series)``, ``admiral_(kancolle)``, ``hammer_(sunset_beach)``
+    — that silently mangle weights on neighbouring fragments if fed in raw.
+
+    Each balanced ``(...)`` group is rewritten as `` \\(...\\)``: the
+    joining underscore in front (if any) becomes a space, and underscores
+    *inside* the qualifier are converted to spaces unconditionally
+    (qualifiers are always word-form). Tag fragments OUTSIDE any paren
+    group still go through the emoticon-aware display rule, so word-form
+    tags get ``_``→space while true emoticons (``o_o``, ``=_=``, ``;_;``)
+    keep their underscores. Lone parens that don't form a balanced pair
+    (the ``)`` in ``:)``) are left alone — the rule only fires on grouped
+    qualifiers, matching the convention Danbooru actually uses.
+
+    Idempotent: already-escaped input passes through unchanged because the
+    paren-group regex skips ``\\(`` via a negative lookbehind.
+    """
+    def _repl(m: re.Match) -> str:
+        inner = to_display_tag(m.group(1)).strip()
+        return f" \\({inner}\\)"
+
+    rewritten = _PAREN_GROUP.sub(_repl, tag)
+    # Drop the joiner underscore(s) that used to attach the qualifier:
+    # ``hammer_ \(sunset beach\)`` → ``hammer \(sunset beach\)``.
+    rewritten = re.sub(r"_+ ", " ", rewritten)
+
+    # Apply display-form to segments outside the escaped paren regions.
+    parts = _ESCAPED_REGION.split(rewritten)
+    parts = [p if p.startswith("\\(") else to_display_tag(p) for p in parts]
+    out = "".join(parts)
+
+    return re.sub(r" {2,}", " ", out).strip()
 
 
 def split_character_trigger(trigger: str) -> tuple[str, str]:

@@ -22,12 +22,39 @@ import urllib.request
 from ..core import db as dblayer
 from ..core import search as searchmod
 from ..core import prompts as promptlib
-from ..core.tagfmt import to_display_tag
+from ..core.tagfmt import to_display_tag, split_character_trigger
 
 
 # ---------------------------------------------------------------------------
 # Tool specs (search.* + the terminal submit_answer)
 # ---------------------------------------------------------------------------
+
+# Canonical focus-tag list (display form, lowercase + spaces). Anything outside
+# this set submitted by the model is treated as empty in _normalize_focus.
+FOCUS_TAGS: tuple[str, ...] = (
+    "ass focus", "food focus", "weapon focus", "plant focus", "foot focus",
+    "solo", "text focus", "book focus", "thigh focus", "hand focus",
+    "monster focus", "cloud focus", "footwear focus", "solo focus",
+    "armpit focus", "animal focus", "other focus", "eye focus",
+    "navel focus", "vehicle focus", "leg focus", "object focus",
+    "pectoral focus", "hip focus", "male focus", "back focus",
+    "clothes focus", "breast focus", "soft focus",
+)
+_FOCUS_TAG_SET: frozenset[str] = frozenset(FOCUS_TAGS)
+
+
+# Canonical character-count tag list (cast/quantity descriptors). Curated from
+# danbooru's character_count grouping with the focus-only tags stripped (they
+# live in the `focus` output) plus composition/meta noise removed.
+CHARACTER_COUNT_TAGS: tuple[str, ...] = (
+    "solo",
+    "1girl", "2girls", "3girls", "4girls", "5girls", "6+girls", "multiple girls",
+    "1boy", "2boys", "3boys", "4boys", "5boys", "6+boys", "multiple boys",
+    "1other", "2others", "3others", "4others", "5others", "6+others", "multiple others",
+    "no humans", "animal", "creature", "people", "crowd", "clone",
+)
+_CHARACTER_COUNT_TAG_SET: frozenset[str] = frozenset(CHARACTER_COUNT_TAGS)
+
 
 SUBMIT_ANSWER_SPEC = {
     "type": "function",
@@ -36,8 +63,9 @@ SUBMIT_ANSWER_SPEC = {
         "description": (
             "Call this exactly once when you have settled on the best matches. "
             "Pass the list of danbooru character keys the user implied (empty "
-            "list if none) and the single danbooru artist key (empty string "
-            "if none). Do NOT include generic descriptive tags — they are "
+            "list if none), the list of danbooru artist keys (empty list if "
+            "none), and at most one image-focus tag (empty string if none "
+            "applies). Do NOT include generic descriptive tags — they are "
             "handled by a different node downstream."
         ),
         "parameters": {
@@ -53,12 +81,39 @@ SUBMIT_ANSWER_SPEC = {
                         "character — empty is the correct answer in that case."
                     ),
                 },
-                "artist": {
-                    "type": "string",
+                "artists": {
+                    "type": "array",
+                    "items": {"type": "string"},
                     "description": (
-                        "Exact danbooru artist key, e.g. 'ebifurya'. Empty "
-                        "string if the user did not name an artist or style — "
-                        "empty is the correct answer in that case."
+                        "Exact danbooru artist keys the user named or clearly "
+                        "implied, e.g. ['ebifurya'] or ['wlop', 'sakimichan']. "
+                        "Usually zero or one; only return multiple if the user "
+                        "explicitly asked to blend styles. Use [] if no artist "
+                        "or style was named — empty is the correct answer "
+                        "in that case."
+                    ),
+                },
+                "focus": {
+                    "type": "string",
+                    "enum": ("", *FOCUS_TAGS),
+                    "description": (
+                        "ONE image-focus tag from the predefined list (see "
+                        "system prompt for the list with definitions), or "
+                        "empty string if no focus tag clearly applies. Empty "
+                        "is the right answer when the user's request doesn't "
+                        "strongly center on a specific focus."
+                    ),
+                },
+                "character_count": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": CHARACTER_COUNT_TAGS},
+                    "description": (
+                        "One or more character-count tags describing the "
+                        "cast/subjects of the image. Multiple can apply "
+                        "(e.g. ['1girl','1boy'] for a girl with a boy; "
+                        "['no humans','animal'] for an animal-only scene). "
+                        "See system prompt for full list with definitions. "
+                        "Use [] only if the request implies no subject at all."
                     ),
                 },
                 "reasoning": {
@@ -66,12 +121,17 @@ SUBMIT_ANSWER_SPEC = {
                     "description": "One short sentence explaining the choice. Optional.",
                 },
             },
-            "required": ["characters", "artist"],
+            "required": ["characters", "artists"],
         },
     },
 }
 
 ALL_TOOLS = list(searchmod.TOOL_SPECS) + [SUBMIT_ANSWER_SPEC]
+
+# Search tools whose `limit` argument the node's search_limit widget should
+# govern. When the widget is set, we override whatever limit the model picked
+# so the user's setting — not the model's guess — controls result breadth.
+_LIMIT_AWARE_TOOLS = frozenset({"search_character", "search_artist", "search_tag"})
 
 
 DEFAULT_SYSTEM_PROMPT = promptlib.load("danbooru_agent")
@@ -117,7 +177,8 @@ def run_agent(host: str,
               top_k: int = 20,
               min_p: float = 0.0,
               presence_penalty: float = 0.0,
-              repeat_penalty: float = -1.0,
+              repeat_penalty: float = 1.0,
+              search_limit: int = 10,
               progress=print):
     """Run the tool-call loop. Returns (submitted_args, transcript).
 
@@ -199,7 +260,12 @@ def run_agent(host: str,
                 submitted = args
                 tool_result = {"status": "received"}
             else:
-                tool_result = searchmod.dispatch(name, args)
+                call_args = args
+                # The node's search_limit widget governs result breadth for
+                # the search tools, overriding the model's own limit guess.
+                if name in _LIMIT_AWARE_TOOLS and search_limit and search_limit > 0:
+                    call_args = {**args, "limit": search_limit}
+                tool_result = searchmod.dispatch(name, call_args)
 
             if debug:
                 preview = json.dumps(tool_result)[:200]
@@ -224,23 +290,57 @@ def run_agent(host: str,
 # ComfyUI node
 # ---------------------------------------------------------------------------
 
-def _normalize_character_keys(submitted: dict) -> list[str]:
-    """Pull a clean list of character keys out of a submit_answer payload.
+def _normalize_focus(submitted: dict) -> str:
+    """Pull the focus field; accept empty string and only values from
+    FOCUS_TAGS. Tolerant of underscore vs space variants (some small
+    models emit `food_focus` despite the spec's enum). Anything that
+    doesn't match → empty."""
+    raw = (submitted.get("focus") or "").strip().lower()
+    if not raw:
+        return ""
+    # Convert underscores to spaces to match the canonical display form.
+    candidate = raw.replace("_", " ")
+    return candidate if candidate in _FOCUS_TAG_SET else ""
 
-    Accepts the canonical `characters: []` shape; also tolerates a legacy
-    `character: ""` field or a stringified list, in case a small model regresses.
+
+def _normalize_character_count(submitted: dict) -> list[str]:
+    """Pull the character_count field as a deduped list of valid tags.
+    Tolerant of stringified comma-separated input, underscores, and case.
+    Anything not in CHARACTER_COUNT_TAGS is silently dropped."""
+    raw = submitted.get("character_count")
+    if isinstance(raw, str):
+        items = [t.strip() for t in raw.split(",") if t.strip()]
+    elif isinstance(raw, list):
+        items = [str(x).strip() for x in raw if str(x).strip()]
+    else:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in items:
+        candidate = t.lower().replace("_", " ")
+        if candidate in _CHARACTER_COUNT_TAG_SET and candidate not in seen:
+            seen.add(candidate)
+            out.append(candidate)
+    return out
+
+
+def _normalize_keys(submitted: dict, plural_field: str, singular_field: str) -> list[str]:
+    """Pull a clean list of keys out of a submit_answer payload.
+
+    Accepts the canonical array shape (``plural_field``); also tolerates a
+    legacy singular string field or a stringified comma-separated list, in
+    case a small model regresses. Dedupes preserving order.
     """
     keys: list[str] = []
-    raw = submitted.get("characters")
+    raw = submitted.get(plural_field)
     if isinstance(raw, list):
         keys = [str(x).strip() for x in raw if str(x).strip()]
     elif isinstance(raw, str) and raw.strip():
         # Model handed us a string instead of a list — accept comma-separated.
         keys = [t.strip() for t in raw.split(",") if t.strip()]
-    legacy = submitted.get("character")
+    legacy = submitted.get(singular_field)
     if isinstance(legacy, str) and legacy.strip() and not keys:
         keys = [legacy.strip()]
-    # Dedupe while preserving order.
     seen: set[str] = set()
     out: list[str] = []
     for k in keys:
@@ -248,21 +348,6 @@ def _normalize_character_keys(submitted: dict) -> list[str]:
             seen.add(k)
             out.append(k)
     return out
-
-
-def _split_character_trigger(trigger: str) -> tuple[str, str]:
-    """Split a character `trigger` string into (character_display, series_display).
-
-    The CSV stores trigger as e.g. ``"hatsune miku, vocaloid"`` — first chunk
-    is the character display name, second is the series. Returns ("", "") if
-    the trigger is empty.
-    """
-    if not trigger:
-        return "", ""
-    parts = [p.strip() for p in trigger.split(",", 1)]
-    if len(parts) == 1:
-        return parts[0], ""
-    return parts[0], parts[1]
 
 
 class DanbooruAgent:
@@ -286,7 +371,27 @@ class DanbooruAgent:
                     "multiline": True,
                 }),
                 "max_iterations": ("INT", {"default": 6, "min": 1, "max": 20}),
-                "temperature": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "search_limit": ("INT", {
+                    "default": 50, "min": 1, "max": 10000,
+                    "tooltip": (
+                        "How many results each character/artist search returns. "
+                        "Overrides the model's own per-call limit, so this is the "
+                        "real knob controlling search breadth. Higher = better "
+                        "recall of less-popular matches, but more tokens in "
+                        "context (slower on local models). Crank to the thousands "
+                        "for effectively-unlimited recall."
+                    ),
+                }),
+                "temperature": ("FLOAT", {
+                    "default": 0.6, "min": 0.0, "max": 2.0, "step": 0.05,
+                    "tooltip": (
+                        "Qwen3's non-thinking chat default is 0.7. This node runs a "
+                        "structured tool-calling extraction, so 0.6 keeps picks "
+                        "steady while still letting the model disambiguate fuzzy "
+                        "character/artist names. Drop to ~0.3 for maximum "
+                        "determinism; raise to 0.7 for the stock chat preset."
+                    ),
+                }),
                 "max_tokens": ("INT", {"default": 1024, "min": 64, "max": 32768}),
                 "seed": ("INT", {"default": -1, "min": -1, "max": 0xffffffffffffffff}),
                 "top_p": ("FLOAT", {
@@ -303,32 +408,46 @@ class DanbooruAgent:
                 }),
                 "presence_penalty": ("FLOAT", {
                     "default": 0.0, "min": -2.0, "max": 2.0, "step": 0.05,
-                    "tooltip": "Penalty for tokens already present in the output. 0 = no penalty (OpenAI default). Always sent — overrides any server CLI flag.",
+                    "tooltip": (
+                        "Token-presence penalty. 0 = off. This is Qwen3's "
+                        "RECOMMENDED lever for curbing runaway repetition: nudge "
+                        "up into 0-2 if the model loops, but high values can cause "
+                        "language mixing. Always sent (overrides any server flag)."
+                    ),
                 }),
                 "repeat_penalty": ("FLOAT", {
-                    "default": -1.0, "min": -1.0, "max": 2.0, "step": 0.05,
-                    "tooltip": "llama.cpp n-gram repetition penalty. -1 = use server default. Typical: 1.1 (1.0 = off).",
+                    "default": 1.0, "min": -1.0, "max": 2.0, "step": 0.05,
+                    "tooltip": (
+                        "llama.cpp n-gram repetition penalty. 1.0 = OFF, which is "
+                        "optimal for Qwen3 tool-calling: penalizing repeats can "
+                        "corrupt the necessarily-repeated structural tokens in JSON "
+                        "tool arguments. -1 = defer to the server default "
+                        "(unpredictable). Prefer presence_penalty for repetition."
+                    ),
                 }),
                 "timeout": ("INT", {"default": 120, "min": 10, "max": 600}),
                 "debug": ("BOOLEAN", {"default": False}),
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING")
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING")
     RETURN_NAMES = (
         "character_triggers",
         "character_series",
         "character_core_tags",
-        "artist_trigger",
+        "artist_triggers",
+        "character_count",
+        "focus",
+        "all_tags",
         "debug_info",
     )
     FUNCTION = "run"
     CATEGORY = "🎨 danbooru-tsc"
 
     def run(self, model, user_request, system_prompt=DEFAULT_SYSTEM_PROMPT,
-            max_iterations=6, temperature=0.3, max_tokens=1024,
+            max_iterations=6, search_limit=50, temperature=0.6, max_tokens=1024,
             seed=-1, top_p=0.8, top_k=20, min_p=0.0,
-            presence_penalty=0.0, repeat_penalty=-1.0,
+            presence_penalty=0.0, repeat_penalty=1.0,
             timeout=120, debug=False):
 
         if not dblayer.db_exists():
@@ -337,7 +456,7 @@ class DanbooruAgent:
                 "Add a 'Danbooru DB Build' node and run it once, "
                 "or run build_db.py from the pack folder."
             )
-            return ("", "", "", "", err)
+            return ("", "", "", "", "", "", "", err)
 
         if isinstance(model, dict):
             host = model.get("host", "localhost")
@@ -348,7 +467,7 @@ class DanbooruAgent:
         if not _server_alive(host, port):
             err = (f"llama.cpp server not reachable at {host}:{port}. "
                    "Add a LlamaCpp Load Model or LlamaCpp External Server node first.")
-            return ("", "", "", "", err)
+            return ("", "", "", "", "", "", "", err)
 
         start = time.time()
         submitted, transcript = run_agent(
@@ -366,61 +485,93 @@ class DanbooruAgent:
             min_p=min_p,
             presence_penalty=presence_penalty,
             repeat_penalty=repeat_penalty,
+            search_limit=search_limit,
         )
         elapsed = time.time() - start
 
         # Resolve final triggers via authoritative DB lookup, not by trusting
-        # whatever strings the model copied back. Per-character outputs use
-        # newline as the inter-character boundary so downstream consumers can
-        # tell where one character's tags end and the next begins; CLIP text
-        # encoders treat newlines as whitespace so a single-CLIP workflow
-        # still "just works". Series is comma-joined and deduped because
-        # it's scene-level context, not per-character.
+        # whatever strings the model copied back. All multi-valued outputs use
+        # '\n' as the inter-item boundary so downstream consumers can split
+        # cleanly. Per-character outputs (triggers, series, core_tags) align
+        # by index — i.e. character_series.split('\n')[i] is the series of
+        # character_triggers.split('\n')[i]. Single-item workflows see no
+        # newlines, so they look identical to the old single-value behavior.
         chosen_char_keys: list[str] = []
-        chosen_art_key = ""
+        chosen_art_keys: list[str] = []
         char_triggers: list[str] = []
         char_series: list[str] = []
         char_core_tags: list[str] = []
-        artist_trigger = ""
+        art_triggers: list[str] = []
+        char_count_tags: list[str] = []
+        focus: str = ""
         resolved_char_rows: list[tuple[str, dict | None]] = []
+        resolved_art_rows: list[tuple[str, dict | None]] = []
 
         if submitted:
-            chosen_char_keys = _normalize_character_keys(submitted)
-            chosen_art_key = (submitted.get("artist") or "").strip()
+            chosen_char_keys = _normalize_keys(submitted, "characters", "character")
+            chosen_art_keys = _normalize_keys(submitted, "artists", "artist")
+            char_count_tags = _normalize_character_count(submitted)
+            focus = _normalize_focus(submitted)
 
-            seen_series: set[str] = set()
             for key in chosen_char_keys:
                 row = searchmod.lookup_character(key)
                 resolved_char_rows.append((key, row))
                 if not row:
+                    # Keep alignment: emit empty placeholders so triggers[i],
+                    # series[i], core_tags[i] still correspond to the same
+                    # character even when one lookup fails.
+                    char_triggers.append("")
+                    char_series.append("")
+                    char_core_tags.append("")
                     continue
-                char_disp, series_disp = _split_character_trigger(row.get("trigger") or "")
+                char_disp, series_disp = split_character_trigger(row.get("trigger") or "")
                 # Fall back to deriving display names from the keys if the
                 # trigger field was missing/oddly shaped.
                 if not char_disp:
                     char_disp = to_display_tag(row.get("character") or key)
                 if not series_disp and row.get("copyright"):
                     series_disp = to_display_tag(row["copyright"])
-                if char_disp:
-                    char_triggers.append(char_disp)
-                if series_disp and series_disp not in seen_series:
-                    seen_series.add(series_disp)
-                    char_series.append(series_disp)
-                core = (row.get("core_tags") or "").strip()
-                if core:
-                    char_core_tags.append(core)
+                char_triggers.append(char_disp)
+                char_series.append(series_disp)
+                char_core_tags.append((row.get("core_tags") or "").strip())
 
-            if chosen_art_key:
-                arow = searchmod.lookup_artist(chosen_art_key)
+            for key in chosen_art_keys:
+                arow = searchmod.lookup_artist(key)
+                resolved_art_rows.append((key, arow))
                 if arow:
-                    artist_trigger = arow.get("trigger") or ""
+                    art_triggers.append(arow.get("trigger") or "")
+                else:
+                    art_triggers.append("")
 
-        # Per-character lines separated by '\n'. For 1 character there is no
-        # newline, so single-char workflows look identical to before.
+        # Per-item lines separated by '\n'. Single-item case has no newline.
         character_triggers = "\n".join(char_triggers)
+        character_series = "\n".join(char_series)
         character_core_tags = "\n".join(char_core_tags)
-        # Series is scene-level — comma-join and dedup is what you want.
-        character_series = ", ".join(char_series)
+        artist_triggers = "\n".join(art_triggers)
+        # character_count uses comma separation (one chunk per tag, all on one line).
+        character_count = ", ".join(char_count_tags)
+
+        # `all_tags`: everything flattened into one comma-separated monolith,
+        # ordered Anima-style: count → char+series interleaved → artists →
+        # focus → core_tags. Per-character name/series stay adjacent
+        # (character_triggers and character_series align by index).
+        monolith_parts: list[str] = []
+        if character_count:
+            monolith_parts.append(character_count)
+        for i, name in enumerate(char_triggers):
+            if name:
+                monolith_parts.append(name)
+            if i < len(char_series) and char_series[i]:
+                monolith_parts.append(char_series[i])
+        for art in art_triggers:
+            if art:
+                monolith_parts.append(art)
+        if focus:
+            monolith_parts.append(focus)
+        for core_line in char_core_tags:
+            if core_line:
+                monolith_parts.append(core_line)
+        all_tags = ", ".join(monolith_parts)
 
         # Debug info
         lines = [
@@ -433,11 +584,20 @@ class DanbooruAgent:
             lines.append("  (none — agent returned empty character list)")
         for key, row in resolved_char_rows:
             if row:
-                disp, series = _split_character_trigger(row.get("trigger") or "")
+                disp, series = split_character_trigger(row.get("trigger") or "")
                 lines.append(f"  '{key}' -> '{disp}' (series='{series}')")
             else:
                 lines.append(f"  '{key}' -> NOT FOUND in DB")
-        lines.append(f"resolved artist:    '{chosen_art_key}' -> trigger='{artist_trigger}'")
+        lines.append(f"resolved artists ({len(chosen_art_keys)}):")
+        if not chosen_art_keys:
+            lines.append("  (none — agent returned empty artist list)")
+        for key, arow in resolved_art_rows:
+            if arow:
+                lines.append(f"  '{key}' -> trigger='{arow.get('trigger') or ''}'")
+            else:
+                lines.append(f"  '{key}' -> NOT FOUND in DB")
+        lines.append(f"character_count: '{character_count}'")
+        lines.append(f"focus: '{focus}'")
         lines.append("")
         lines.append("--- transcript ---")
         for i, turn in enumerate(transcript):
@@ -465,6 +625,9 @@ class DanbooruAgent:
             character_triggers,
             character_series,
             character_core_tags,
-            artist_trigger,
+            artist_triggers,
+            character_count,
+            focus,
+            all_tags,
             debug_info,
         )

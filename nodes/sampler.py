@@ -24,11 +24,39 @@ from ..core.tagfmt import to_display_tag
 
 _FALLBACK_GROUPS = ["(rebuild DB first)"]
 
+# ComfyUI calls INPUT_TYPES once per node on *every* prompt validation
+# (server validate_prompt runs before execution caching kicks in). With many
+# sampler nodes in a graph that means one DB connect+query per node per queue
+# just to repopulate an essentially-static dropdown. Memoize the result and
+# key it on the DB file's (mtime_ns, size): a rebuild via the DB Build node
+# changes those, invalidating the cache automatically without a restart. The
+# replacement cost is a stat() (~microseconds) instead of ~1.4ms of I/O.
+_GROUPS_CACHE: list[str] | None = None
+_GROUPS_CACHE_KEY: tuple[int, int] | None = None
+
+
+def _db_signature() -> tuple[int, int] | None:
+    """(mtime_ns, size) of the DB file, or None if it isn't present."""
+    try:
+        st = dblayer.DB_PATH.stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
 
 def _list_groups() -> list[str]:
-    """Distinct grouping names, alphabetized. Used to populate the dropdown."""
-    if not dblayer.db_exists():
+    """Distinct grouping names, alphabetized. Used to populate the dropdown.
+
+    Memoized against the DB file signature so repeated INPUT_TYPES calls
+    don't each reopen the database (see cache note above). Returns a fresh
+    list each call so callers can't corrupt the cached copy.
+    """
+    global _GROUPS_CACHE, _GROUPS_CACHE_KEY
+    sig = _db_signature()
+    if sig is None:
         return list(_FALLBACK_GROUPS)
+    if _GROUPS_CACHE is not None and sig == _GROUPS_CACHE_KEY:
+        return list(_GROUPS_CACHE)
     try:
         conn = dblayer.connect()
         try:
@@ -37,10 +65,12 @@ def _list_groups() -> list[str]:
             ).fetchall()
         finally:
             conn.close()
-        groups = [r["grouping"] for r in rows if r["grouping"]]
-        return groups or list(_FALLBACK_GROUPS)
+        groups = [r["grouping"] for r in rows if r["grouping"]] or list(_FALLBACK_GROUPS)
     except Exception:
         return list(_FALLBACK_GROUPS)
+    _GROUPS_CACHE = groups
+    _GROUPS_CACHE_KEY = sig
+    return list(groups)
 
 
 # ---------------------------------------------------------------------------
@@ -121,24 +151,23 @@ def _short_def(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 # Order matters: this is the dropdown order users see.
-# Definitions use an em-dash (" — ") as the tag/def separator: parens collide
-# with tags that contain them (e.g. "hatsune miku (cosplay)").
+# Definitions are wrapped in curly braces: no danbooru tag contains them,
+# so the output stays unambiguously parseable.
 FORMAT_OPTIONS = [
     "tags",                      # blush, smile, looking at viewer
     "labeled",                   # face_tags: blush, smile, looking at viewer
     "group_only",                # face_tags
-    "inline_with_defs",          # blush — rosy cheeks, smile — happy expression
-    "labeled_inline_with_defs",  # face_tags: blush — rosy cheeks, smile — happy expression
+    "inline_with_defs",          # blush {rosy cheeks}, smile {happy expression}
+    "labeled_inline_with_defs",  # face_tags: blush {rosy cheeks}, smile {happy expression}
     "newline",                   # one tag per line, no group, no defs
-    "newline_with_defs",         # one "tag — def" per line, no group
+    "newline_with_defs",         # one "tag {def}" per line, no group
     "yaml_with_defs",            # multi-line YAML: group header + "- tag: def" lines
 ]
 
 
-# Separator between tag and its definition. Chosen because em-dashes do not
-# appear in danbooru tags and are rare in the first sentence of definitions,
-# so the output stays unambiguously parseable by " — ".
-_DEF_SEP = " — "
+def _with_def(tag: str, definition: str) -> str:
+    """Render a tag with its definition wrapped in curly braces."""
+    return f"{tag} {{{definition}}}" if definition else tag
 
 
 def _format_output(group: str, picked_tags: list[str],
@@ -164,15 +193,15 @@ def _format_output(group: str, picked_tags: list[str],
         return ("\n".join(anima), n_with_def)
 
     if fmt == "inline_with_defs":
-        parts = [f"{a}{_DEF_SEP}{d}" if d else a for a, d in zip(anima, defs)]
+        parts = [_with_def(a, d) for a, d in zip(anima, defs)]
         return (", ".join(parts), n_with_def)
 
     if fmt == "labeled_inline_with_defs":
-        parts = [f"{a}{_DEF_SEP}{d}" if d else a for a, d in zip(anima, defs)]
+        parts = [_with_def(a, d) for a, d in zip(anima, defs)]
         return (f"{group}: " + ", ".join(parts), n_with_def)
 
     if fmt == "newline_with_defs":
-        parts = [f"{a}{_DEF_SEP}{d}" if d else a for a, d in zip(anima, defs)]
+        parts = [_with_def(a, d) for a, d in zip(anima, defs)]
         return ("\n".join(parts), n_with_def)
 
     if fmt == "yaml_with_defs":
@@ -241,7 +270,10 @@ class RandomTagSampler:
         return {
             "required": {
                 "group": (groups, {"default": default_group}),
-                "count": ("INT", {"default": 5, "min": 1, "max": 100}),
+                "count": ("INT", {
+                    "default": 5, "min": 1, "max": 100,
+                    "tooltip": "Maximum tags to pick. Final count may be lower when output_chance < 1.0 (each pick is rolled independently).",
+                }),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "output_format": (FORMAT_OPTIONS, {
                     "default": "tags",
@@ -250,10 +282,10 @@ class RandomTagSampler:
                         "  tags                     - blush, smile\n"
                         "  labeled                  - face_tags: blush, smile\n"
                         "  group_only               - face_tags\n"
-                        "  inline_with_defs         - blush — rosy cheeks, smile — happy\n"
-                        "  labeled_inline_with_defs - face_tags: blush — rosy cheeks, ...\n"
+                        "  inline_with_defs         - blush {rosy cheeks}, smile {happy}\n"
+                        "  labeled_inline_with_defs - face_tags: blush {rosy cheeks}, ...\n"
                         "  newline                  - one tag per line\n"
-                        "  newline_with_defs        - one 'tag — def' per line\n"
+                        "  newline_with_defs        - one 'tag {def}' per line\n"
                         "  yaml_with_defs           - multi-line YAML with group header"
                     ),
                 }),
@@ -273,8 +305,9 @@ class RandomTagSampler:
                     "tooltip": "Comma- or newline-separated tags to NEVER pick. Either form works (e.g. 'turn_pale' or 'turn pale').",
                 }),
                 "output_chance": ("FLOAT", {
-                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Probability of emitting any output. 1.0=always, 0.0=never. On a miss, all string outputs (including group) are empty.",
+                    "default": 1.0, "min": 0.0, "max": 1.0,
+                    "step": 0.01, "round": 0.001,
+                    "tooltip": "Per-tag keep probability. 1.0=keep every pick, 0.0=drop every pick. Each of the up-to-`count` picks is rolled independently. Inc/dec by 0.01; type values down to 0.001.",
                 }),
             },
         }
@@ -299,9 +332,6 @@ class RandomTagSampler:
         banned = _parse_banned(banned_tags)
         rng = random.Random(seed)
 
-        # DB fetch happens before the chance gate so the skip-branch debug can
-        # still report the full group contents. The chance roll is still the
-        # first rng draw, so seed→roll mapping is unchanged.
         conn = dblayer.connect()
         try:
             rows = conn.execute(
@@ -340,36 +370,24 @@ class RandomTagSampler:
                 f"\nNo tags left in group '{group}' after filters.",
             )
 
-        # Compute weights/probabilities up front so both the skip and pass
-        # branches can display per-tag pick probability.
         counts = [r["count"] for r in rows]
         weights, probs = _compute_weights_and_probs(counts, popularity_weight)
-
-        # Output-chance gate
-        chance_roll = rng.random()
-        if chance_roll >= output_chance:
-            debug = (
-                f"=== RandomTagSampler ===\n"
-                f"group              : {group}\n"
-                f"output_format      : {output_format}\n"
-                f"output_chance      : {output_chance}\n"
-                f"roll               : {chance_roll:.4f} (>= chance, SKIPPED)\n"
-                f"seed               : {seed}\n"
-                f"raw members        : {n_raw} (before filters)\n"
-                f"available members  : {len(rows)} (after filters)\n"
-                f"min_post_count     : {min_post_count}\n"
-                f"banned tags hit    : {n_banned_hit} of {len(banned)} declared\n"
-                f"popularity_weight  : {popularity_weight}\n"
-                f"\ngroup contents (tag: post_count (pick %), sorted by % desc):\n"
-                f"{_format_group_listing(rows, probs=probs)}"
-            )
-            return ("", debug)
 
         # Map tag -> definition for the picked-tag lookup later
         tag_to_def = {r["tag"]: (r["definition"] or "") for r in rows}
         tags = [r["tag"] for r in rows]
 
-        picked_tags = _weighted_sample_no_replace(tags, weights, count, rng)
+        candidates = _weighted_sample_no_replace(tags, weights, count, rng)
+
+        # Per-tag chance gate: each sampled candidate independently survives
+        # with probability output_chance. Skip the rolls entirely at 1.0 so
+        # seed→output stays stable for the common case.
+        if output_chance >= 1.0:
+            picked_tags = candidates
+        else:
+            picked_tags = [t for t in candidates if rng.random() < output_chance]
+        n_dropped = len(candidates) - len(picked_tags)
+
         picked_set = set(picked_tags)
         out, n_with_def = _format_output(group, picked_tags, tag_to_def, output_format)
 
@@ -382,12 +400,14 @@ class RandomTagSampler:
             f"min_post_count     : {min_post_count}\n"
             f"banned tags hit    : {n_banned_hit} of {len(banned)} declared\n"
             f"popularity_weight  : {popularity_weight}\n"
-            f"output_chance      : {output_chance} (roll {chance_roll:.4f}, passed)\n"
-            f"requested count    : {count}\n"
+            f"output_chance      : {output_chance} (per-tag)\n"
+            f"max count          : {count}\n"
+            f"sampled            : {len(candidates)}\n"
+            f"dropped by chance  : {n_dropped}\n"
             f"returned count     : {len(picked_tags)}\n"
             f"definitions found  : {n_with_def} of {len(picked_tags)}\n"
             f"seed               : {seed}\n"
-            f"\ngroup contents (tag: post_count (pick %), sorted by % desc; [*] = picked):\n"
+            f"\ngroup contents (tag: post_count (pick %), sorted by % desc; [*] = kept):\n"
             f"{_format_group_listing(rows, picked_set=picked_set, probs=probs)}\n"
             f"\noutput:\n{out}"
         )

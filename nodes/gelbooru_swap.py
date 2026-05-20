@@ -13,7 +13,7 @@ from __future__ import annotations
 import csv
 
 from ..core import db as dblayer
-from ..core.tagfmt import to_display_tag
+from ..core.tagfmt import to_display_tag, escape_for_comfy
 
 
 _OVERRIDES_CACHE: dict[str, str] | None = None
@@ -80,11 +80,17 @@ class GelbooruTagSwap:
                 # underscore and space input; emits display form.
                 tok_key = to_display_tag(tok)
                 replacement = overrides.get(tok_key)
+                emitted = replacement if replacement else tok
+                # Several overrides target paren-qualifier forms (e.g.
+                # `female_masturbation` → `masturbation_(female)`), and
+                # the input may already carry qualifier tags untouched.
+                # Run every emitted token through the comfy-escape rule so
+                # the output is safe for CLIPTextEncode either way. The
+                # helper is idempotent on already-escaped input.
+                emitted = escape_for_comfy(emitted)
                 if replacement:
-                    swaps.append((tok, replacement))
-                    out_tokens.append(replacement)
-                else:
-                    out_tokens.append(tok)
+                    swaps.append((tok, emitted))
+                out_tokens.append(emitted)
             out_lines.append(", ".join(out_tokens))
 
         report = [f"{len(overrides):,} overrides loaded, {len(swaps)} applied"]

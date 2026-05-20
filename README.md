@@ -136,22 +136,21 @@ pick up changes.
 | File                                         | Used by                                              |
 |----------------------------------------------|------------------------------------------------------|
 | `prompts/danbooru_agent.md`                  | Danbooru Agent                                       |
-| `prompts/anima_enhancer.md`                  | Anima Fast Enhancer                                  |
 | `prompts/tag_refiner_filter.md`              | Tag Refiner (`filter` mode)                          |
 | `prompts/tag_refiner_filter_search.md`       | Tag Refiner (`filter+search` mode)                   |
 | `prompts/tag_refiner_filter_search_lookup.md`| Tag Refiner (`filter+search+lookup` mode)            |
 
-The Agent and Fast Enhancer also expose a `system_prompt` STRING input on the
-node itself — its default is the file content, but you can override per-run
-without touching the file. The Refiner picks the right file automatically based
-on its `mode` dropdown (no per-run override).
+The Agent also exposes a `system_prompt` STRING input on the node itself — its
+default is the file content, but you can override per-run without touching the
+file. The Refiner picks the right file automatically based on its `mode`
+dropdown (no per-run override).
 
 Loading is handled by the tiny `core/prompts.py` module: `promptlib.load("name")`
 returns the raw text of `prompts/name.md`.
 
 ---
 
-## The 9 nodes
+## The 8 nodes
 
 ### DB management
 
@@ -175,7 +174,7 @@ Tiny info node — prints current row counts and `built_at`. Always re-runs (via
 
 ### LLM nodes (require a llama.cpp server reachable at `host:port`)
 
-All three of these nodes accept an `LLAMACPP_MODEL` input — a `{host, port}` dict
+Both of these nodes accept an `LLAMACPP_MODEL` input — a `{host, port}` dict
 typically supplied by an external "LlamaCpp Load Model" or "LlamaCpp External
 Server" node. They POST to `http://<host>:<port>/v1/chat/completions` with
 OpenAI-style tool-call payloads.
@@ -200,25 +199,6 @@ System prompt: `prompts/danbooru_agent.md` (overridable via the node's
 
 - **Out:** `character_trigger`, `character_core_tags`, `artist_trigger`,
   `extra_tags`, `combined_prompt`, `debug_info`
-
-#### 🎨 Anima Fast Enhancer (LLM) (`nodes/fast_enhancer.py` — `AnimaFastEnhancer`)
-
-Single-LLM-call enhancer — takes a user request + character/artist context +
-pre-rolled `seed_tags` and makes ONE chat completion call to write the 2-5
-sentence prose description.
-
-The LLM picks which seed tags fit, weaves them in, and ignores the rest. No DB
-dependency.
-
-Inputs of note:
-
-- `seed_tags` — paste/wire the `tags_with_definitions` output from one or more
-  `RandomTagSampler` nodes. Concat upstream if you want multiple groups.
-- `character_core_tags` — when wired, the prompt tells the LLM not to
-  re-describe canonical visuals (the Composer encodes them separately).
-- `system_prompt` — defaults to `prompts/anima_enhancer.md`, overridable.
-
-- **Out:** `enhanced_prose`, `debug_info`
 
 #### 🎨 Danbooru Tag Refiner (LLM) (`nodes/refiner.py` — `DanbooruTagRefiner`)
 

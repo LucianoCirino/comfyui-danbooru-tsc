@@ -16,6 +16,14 @@ except ImportError:  # script use
     from tagfmt import to_display_tag  # type: ignore
 
 
+# Hard ceiling on how many rows the substring search tools (character /
+# artist / tag) will return. The DanbooruAgent's `search_limit` widget can
+# drive the requested limit all the way up to this value; the ceiling exists
+# only as a guardrail against pathological inputs, not as a product limit.
+# Practical FTS matches return far fewer rows than this in any case.
+MAX_SEARCH_LIMIT = 10000
+
+
 # ---------------------------------------------------------------------------
 # Characters
 # ---------------------------------------------------------------------------
@@ -31,8 +39,8 @@ def search_character(query: str, limit: int = 10) -> list[dict[str, Any]]:
         return []
     if limit < 1:
         limit = 1
-    if limit > 50:
-        limit = 50
+    if limit > MAX_SEARCH_LIMIT:
+        limit = MAX_SEARCH_LIMIT
 
     # Normalize the query to the same form the FTS index stores: underscore→
     # space for word-form input, untouched for emoticons. Lets callers pass
@@ -112,8 +120,8 @@ def search_artist(query: str, limit: int = 10) -> list[dict[str, Any]]:
         return []
     if limit < 1:
         limit = 1
-    if limit > 50:
-        limit = 50
+    if limit > MAX_SEARCH_LIMIT:
+        limit = MAX_SEARCH_LIMIT
 
     # See search_character for the rationale on to_display_tag here.
     fts_query = dblayer.fts_escape(to_display_tag(query))
@@ -192,8 +200,8 @@ def search_tag(query: str, limit: int = 10, search_definition: bool = True) -> l
         return []
     if limit < 1:
         limit = 1
-    if limit > 50:
-        limit = 50
+    if limit > MAX_SEARCH_LIMIT:
+        limit = MAX_SEARCH_LIMIT
 
     # See search_character for the rationale on to_display_tag here.
     fts_query = dblayer.fts_escape(to_display_tag(query))
@@ -250,7 +258,10 @@ def search_tag(query: str, limit: int = 10, search_definition: bool = True) -> l
 
     return [
         {
-            "tag": r["tag"],
+            # Emit in display form (underscores → spaces, lowercased) so the
+            # LLM that copies our result into its final prompt naturally uses
+            # the form Anima expects.
+            "tag": to_display_tag(r["tag"]),
             "count": r["count"],
             # Truncate to keep the LLM context tight
             "definition": (r["definition"][:300] + "...") if len(r["definition"]) > 300 else r["definition"],
@@ -282,7 +293,133 @@ def lookup_tag(tag: str) -> dict[str, Any] | None:
         conn.close()
     if row is None:
         return None
-    return {"tag": row["tag"], "count": row["count"], "definition": row["definition"]}
+    # Display form so the LLM uses spaces (not underscores) when copying.
+    return {"tag": to_display_tag(row["tag"]), "count": row["count"], "definition": row["definition"]}
+
+
+def list_tag_groupings(filter: str = "", limit: int = 30) -> list[dict[str, Any]]:
+    """List available danbooru tag groupings (categories), optionally filtered.
+
+    The DB has ~950 distinct groupings, often hierarchical with ``:`` separators
+    (e.g. ``image_composition:framing_the_body``, ``posture:standing``). Returns
+    groupings ordered by number of tags they contain.
+    """
+    if limit < 1:
+        limit = 1
+    if limit > 100:
+        limit = 100
+    conn = dblayer.connect()
+    try:
+        if filter and filter.strip():
+            rows = conn.execute(
+                """
+                SELECT grouping, COUNT(*) AS n
+                FROM tag_groupings
+                WHERE grouping LIKE ?
+                GROUP BY grouping
+                ORDER BY n DESC
+                LIMIT ?
+                """,
+                (f"%{filter.strip()}%", limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT grouping, COUNT(*) AS n
+                FROM tag_groupings
+                GROUP BY grouping
+                ORDER BY n DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+    finally:
+        conn.close()
+    return [{"grouping": r["grouping"], "tag_count": r[1]} for r in rows]
+
+
+def list_tags_in_grouping(grouping: str, limit: int = 20) -> list[dict[str, Any]]:
+    """List tags within a specific grouping, ordered by popularity (post count).
+
+    Use after ``list_tag_groupings`` finds the right category. Tag names are
+    emitted in display form (spaces, not underscores) so the LLM can copy them
+    straight into a prompt.
+    """
+    if not grouping or not grouping.strip():
+        return []
+    if limit < 1:
+        limit = 1
+    if limit > 100:
+        limit = 100
+    conn = dblayer.connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT t.tag, t.count
+            FROM tag_groupings tg
+            JOIN tags t ON t.id = tg.tag_id
+            WHERE tg.grouping = ?
+            ORDER BY t.count DESC
+            LIMIT ?
+            """,
+            (grouping.strip(), limit),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [{"tag": to_display_tag(r["tag"]), "count": r["count"]} for r in rows]
+
+
+def lookup_tags(tags: list[str]) -> list[dict[str, Any]]:
+    """Bulk exact-lookup for a list of tag keys. Returns one entry per input
+    in input order. Missing tags get ``{"tag": <input>, "found": False}`` so
+    the LLM can tell which DanBot suggestions don't exist in the DB.
+
+    One SQL round-trip regardless of input size, with both display-form and
+    underscore-slug attempted for each input.
+    """
+    if not tags:
+        return []
+    cleaned = [(t or "").strip() for t in tags]
+    # Build the set of candidate spellings we'll query in one shot.
+    candidates: set[str] = set()
+    for c in cleaned:
+        if not c:
+            continue
+        lo = c.lower()
+        candidates.add(lo)
+        candidates.add(lo.replace(" ", "_"))
+    if not candidates:
+        return [{"tag": orig, "found": False} for orig in cleaned]
+    conn = dblayer.connect()
+    try:
+        placeholders = ",".join("?" * len(candidates))
+        rows = conn.execute(
+            f"SELECT tag, count, definition FROM tags WHERE tag IN ({placeholders})",
+            list(candidates),
+        ).fetchall()
+    finally:
+        conn.close()
+    found = {r["tag"]: {"tag": r["tag"], "count": r["count"], "definition": r["definition"]} for r in rows}
+    out: list[dict[str, Any]] = []
+    for orig in cleaned:
+        if not orig:
+            out.append({"tag": orig, "found": False})
+            continue
+        lo = orig.lower()
+        hit = found.get(lo) or found.get(lo.replace(" ", "_"))
+        if hit:
+            # Truncate long definitions to keep context tight (matches search_tag).
+            d = hit["definition"]
+            out.append({
+                # Display form (spaces, not underscores) so the LLM copies
+                # the form Anima expects.
+                "tag": to_display_tag(hit["tag"]),
+                "count": hit["count"],
+                "definition": (d[:300] + "...") if len(d) > 300 else d,
+            })
+        else:
+            out.append({"tag": orig, "found": False})
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -394,11 +531,16 @@ TAG_TOOL_SPECS = [
         "function": {
             "name": "search_tag",
             "description": (
-                "Search the danbooru general tag vocabulary by name or "
-                "definition. Use this to find candidate tags for a concept "
-                "the user described. Returns up to `limit` matching tags "
-                "ordered by popularity (post count), with their definitions "
-                "(truncated)."
+                "SUBSTRING search over danbooru tag names + definitions. "
+                "Keep queries SHORT — one concept per call, 1-2 words max. "
+                "Multi-concept queries like 'walking outdoors park' look for "
+                "a single tag containing ALL those words, which almost never "
+                "exists; they will return empty. For several unrelated "
+                "concepts, issue PARALLEL `search_tag` tool_calls in ONE "
+                "response (do not spread them across iterations). "
+                "Examples of good queries: 'walking', 'outdoors', 'sunny', "
+                "'bokeh', 'shy', 'soft smile'. Returns up to `limit` "
+                "matching tags ordered by popularity (post count)."
             ),
             "parameters": {
                 "type": "object",
@@ -438,6 +580,94 @@ TAG_TOOL_SPECS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_tag_groupings",
+            "description": (
+                "List danbooru tag groupings (categories). Use this BEFORE "
+                "search_tag when looking for a categorical concept where you "
+                "don't know the canonical tag name. Common groupings: "
+                "image_composition, image_composition:framing_the_body, "
+                "posture, eyes_tags, face_tags, hair_styles, attire, "
+                "headwear, accessories, locations, body_parts, "
+                "verbs_and_gerunds. Optional `filter` is a substring match "
+                "on grouping names. Returns groupings ordered by number of "
+                "tags they contain."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filter": {
+                        "type": "string",
+                        "description": "Substring to filter grouping names (e.g. 'composition', 'eyes', 'posture'). Empty = list top groupings.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results (1-100). Default 30.",
+                        "default": 30,
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_tags_in_grouping",
+            "description": (
+                "List tags within a specific grouping, ordered by popularity. "
+                "Use AFTER list_tag_groupings finds the right category. "
+                "Example: list_tags_in_grouping('image_composition:framing_the_body') "
+                "returns the actual valid framing tags ('full body', "
+                "'upper body', 'cowboy shot', 'portrait', ...) rather than "
+                "you guessing free-text names like 'medium shot' that aren't "
+                "real tags."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "grouping": {
+                        "type": "string",
+                        "description": "Exact grouping name returned by list_tag_groupings.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results (1-100). Default 20.",
+                        "default": 20,
+                    },
+                },
+                "required": ["grouping"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_tag_definitions",
+            "description": (
+                "Bulk version of get_tag_definition. Pass a list of tag names "
+                "and get back their definitions in one call. Returns one entry "
+                "per input tag, in input order. Missing tags get "
+                "{tag: <input>, found: false} so you can tell which DanBot "
+                "candidates don't exist in the DB. Use this to verify all "
+                "DanBot tags up-front against the description before deciding "
+                "what to keep — more efficient than calling get_tag_definition "
+                "one at a time."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of tag names to look up.",
+                    },
+                },
+                "required": ["tags"],
+            },
+        },
+    },
 ]
 
 
@@ -449,6 +679,9 @@ DISPATCH = {
     "lookup_artist": lookup_artist,
     "search_tag": search_tag,
     "get_tag_definition": lookup_tag,
+    "get_tag_definitions": lookup_tags,
+    "list_tag_groupings": list_tag_groupings,
+    "list_tags_in_grouping": list_tags_in_grouping,
 }
 
 
