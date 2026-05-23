@@ -13,7 +13,7 @@ from __future__ import annotations
 import csv
 
 from ..core import db as dblayer
-from ..core.tagfmt import to_display_tag, escape_for_comfy
+from ..core.tagfmt import to_display_tag, escape_for_comfy, load_known_paren_tags
 
 
 _OVERRIDES_CACHE: dict[str, str] | None = None
@@ -68,6 +68,7 @@ class GelbooruTagSwap:
         if not overrides:
             return (tags, f"no overrides loaded — is {_OVERRIDES_PATH.name} present?")
 
+        known = load_known_paren_tags()
         swaps: list[tuple[str, str]] = []
         out_lines: list[str] = []
         for line in tags.split("\n"):
@@ -85,9 +86,10 @@ class GelbooruTagSwap:
                 # `female_masturbation` → `masturbation_(female)`), and
                 # the input may already carry qualifier tags untouched.
                 # Run every emitted token through the comfy-escape rule so
-                # the output is safe for CLIPTextEncode either way. The
-                # helper is idempotent on already-escaped input.
-                emitted = escape_for_comfy(emitted)
+                # the output is safe for CLIPTextEncode either way. Gated on
+                # the known-tag set so a pass-through weight wrapper isn't
+                # mangled; idempotent on already-escaped input.
+                emitted = escape_for_comfy(emitted, known)
                 if replacement:
                     swaps.append((tok, emitted))
                 out_tokens.append(emitted)
