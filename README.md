@@ -150,7 +150,7 @@ returns the raw text of `prompts/name.md`.
 
 ---
 
-## The 8 nodes
+## The nodes
 
 ### DB management
 
@@ -253,6 +253,39 @@ Notes:
 - `append_prose=True` enables Anima's "mixed mode" — tag list + free prose
 
 - **Out:** `positive_prompt`, `negative_prompt`
+
+#### 🎨 ComfyUI Tag Escape (`nodes/comfy_escape.py` — `ComfyTagEscape`)
+
+Backslash-escapes the literal parens inside Danbooru/Gelbooru tags so ComfyUI's
+prompt parser reads them as text rather than weight syntax. ComfyUI treats an
+unescaped `(...)` as a weight group (`(tag:1.2)`), so a qualifier tag like
+`fate_(series)` or `admiral_(kancolle)` fed into CLIPTextEncode raw breaks
+parsing and silently mangles the weights of neighbouring tags. This node
+rewrites it to `fate \(series\)`.
+
+Crucially it escapes **only** parens that belong to a *real* tag — one present
+in `csv/danbooru_tags.csv` or `csv/gelbooru_overrides.csv`. A paren you wrote
+yourself — e.g. a weight wrapper like `(@artist_name:1.0)` — is not a Danbooru
+tag, so it is passed through untouched. This is *not* a blanket "escape every
+`(`" pass; that distinction is the whole point of the node.
+
+| Input                  | Output                  | Why                                  |
+|------------------------|-------------------------|--------------------------------------|
+| `fate_(series)`        | `fate \(series\)`       | recognized tag → escape + display    |
+| `masturbation_(female)`| `masturbation \(female\)`| recognized Gelbooru override form    |
+| `(@artist_name:1.0)`   | `(@artist_name:1.0)`    | your own weight wrapper → untouched  |
+| `(fate (series):1.2)`  | `(fate \(series\):1.2)` | escapes only the inner real tag      |
+| `long_hair`            | `long hair`             | no parens → display form             |
+| `o_o`, `:)`            | unchanged               | emoticon / lone paren left alone     |
+
+The known-tag set is loaded once from the two CSVs (~240k paren-bearing names)
+and cached for the process. Accepts comma/newline-separated tags in underscore
+or space form; commas and newlines are preserved so per-character outputs flow
+cleanly. Idempotent on already-escaped input, so it's safe to chain after
+**Gelbooru Tag Swap**, which applies the same gated escape to its own output.
+
+- **In:** `tags`
+- **Out:** `tags`
 
 ---
 
