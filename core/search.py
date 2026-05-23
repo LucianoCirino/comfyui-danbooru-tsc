@@ -369,13 +369,18 @@ def list_tags_in_grouping(grouping: str, limit: int = 20) -> list[dict[str, Any]
     return [{"tag": to_display_tag(r["tag"]), "count": r["count"]} for r in rows]
 
 
-def lookup_tags(tags: list[str]) -> list[dict[str, Any]]:
+def lookup_tags(tags: list[str], include_grouping: bool = False) -> list[dict[str, Any]]:
     """Bulk exact-lookup for a list of tag keys. Returns one entry per input
     in input order. Missing tags get ``{"tag": <input>, "found": False}`` so
     the LLM can tell which DanBot suggestions don't exist in the DB.
 
     One SQL round-trip regardless of input size, with both display-form and
     underscore-slug attempted for each input.
+
+    ``include_grouping`` adds a ``grouping`` key (the raw pipe-separated
+    ``tags.grouping`` string) to each found entry. Off by default so the
+    agent's ``get_tag_definitions`` tool output stays unchanged; the
+    DanbooruTagAnnotator opts in when its "include_group" toggle is on.
     """
     if not tags:
         return []
@@ -390,16 +395,22 @@ def lookup_tags(tags: list[str]) -> list[dict[str, Any]]:
         candidates.add(lo.replace(" ", "_"))
     if not candidates:
         return [{"tag": orig, "found": False} for orig in cleaned]
+    cols = "tag, count, definition" + (", grouping" if include_grouping else "")
     conn = dblayer.connect()
     try:
         placeholders = ",".join("?" * len(candidates))
         rows = conn.execute(
-            f"SELECT tag, count, definition FROM tags WHERE tag IN ({placeholders})",
+            f"SELECT {cols} FROM tags WHERE tag IN ({placeholders})",
             list(candidates),
         ).fetchall()
     finally:
         conn.close()
-    found = {r["tag"]: {"tag": r["tag"], "count": r["count"], "definition": r["definition"]} for r in rows}
+    found: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        entry = {"tag": r["tag"], "count": r["count"], "definition": r["definition"]}
+        if include_grouping:
+            entry["grouping"] = r["grouping"]
+        found[r["tag"]] = entry
     out: list[dict[str, Any]] = []
     for orig in cleaned:
         if not orig:
@@ -410,13 +421,16 @@ def lookup_tags(tags: list[str]) -> list[dict[str, Any]]:
         if hit:
             # Truncate long definitions to keep context tight (matches search_tag).
             d = hit["definition"]
-            out.append({
+            entry = {
                 # Display form (spaces, not underscores) so the LLM copies
                 # the form Anima expects.
                 "tag": to_display_tag(hit["tag"]),
                 "count": hit["count"],
                 "definition": (d[:300] + "...") if len(d) > 300 else d,
-            })
+            }
+            if include_grouping:
+                entry["grouping"] = hit.get("grouping", "")
+            out.append(entry)
         else:
             out.append({"tag": orig, "found": False})
     return out

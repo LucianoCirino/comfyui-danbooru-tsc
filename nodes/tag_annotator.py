@@ -2,9 +2,15 @@
 definition in a configurable output format.
 
 Mirror of the RandomTagSampler's output-format dropdown (minus the
-group-aware options, since this node has no group concept). Default is
+labeled/group_only options, which assume a single shared group). Default is
 `inline_with_defs` — the comma-separated `tag {definition}` form, since
 the whole point of the node is feeding definitions into a downstream LLM.
+
+The optional `include_group` toggle prefixes each definition with the
+top-level group(s) the tag belongs to, e.g. `blush {[face_tags] rosy
+cheeks}`. Unlike the sampler — which works within one chosen group — an
+arbitrary input tag can belong to several groups, so all top-level groups
+are listed.
 """
 from __future__ import annotations
 
@@ -15,6 +21,21 @@ from ..core.search import lookup_tags
 
 
 _SPLIT_RE = re.compile(r"[,\n]+")
+
+
+def _top_level_groups(grouping: str) -> list[str]:
+    """Deduped top-level group names from the pipe-separated, hierarchical
+    `tags.grouping` string. 'face_tags|face_tags:emotions' -> ['face_tags'];
+    'eyes_tags|eyes_tags:gazes|posture' -> ['eyes_tags', 'posture']. Order is
+    preserved by first appearance."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for part in grouping.split("|"):
+        top = part.split(":", 1)[0].strip()
+        if top and top not in seen:
+            seen.add(top)
+            out.append(top)
+    return out
 
 
 # Same dropdown shape as RandomTagSampler (minus labeled/group_only, which
@@ -94,6 +115,17 @@ class DanbooruTagAnnotator:
                         "the `tags` and `newline` formats."
                     ),
                 }),
+                "include_group": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": (
+                        "Prefix each definition with the top-level danbooru "
+                        "group(s) the tag belongs to, e.g.\n"
+                        "  blush {[face_tags] rosy cheeks}\n"
+                        "A tag in several groups lists them all "
+                        "([eyes_tags, posture, ...]). Has no effect on the "
+                        "`tags` and `newline` formats (they drop definitions)."
+                    ),
+                }),
             },
         }
 
@@ -103,7 +135,7 @@ class DanbooruTagAnnotator:
     CATEGORY = "🎨 danbooru-tsc"
 
     def run(self, tags: str, output_format: str = "inline_with_defs",
-            max_definition_chars: int = 300):
+            max_definition_chars: int = 300, include_group: bool = False):
         if not dblayer.db_exists():
             err = (
                 f"danbooru.db not found at {dblayer.DB_PATH}. "
@@ -122,7 +154,7 @@ class DanbooruTagAnnotator:
                 seen.add(t)
                 ordered.append(t)
 
-        results = lookup_tags(ordered)
+        results = lookup_tags(ordered, include_grouping=include_group)
 
         # Build aligned (tag_display, definition) pairs and a not-found list.
         picked: list[str] = []
@@ -134,6 +166,13 @@ class DanbooruTagAnnotator:
                 defn = res["definition"] or ""
                 if len(defn) > max_definition_chars:
                     defn = defn[:max_definition_chars] + "..."
+                if include_group:
+                    groups = _top_level_groups(res.get("grouping") or "")
+                    if groups:
+                        label = "[" + ", ".join(groups) + "]"
+                        # Keep the group visible even when the tag has no
+                        # textual definition (so the braces aren't dropped).
+                        defn = f"{label} {defn}".rstrip() if defn else label
                 picked.append(tag_disp)
                 tag_to_def[tag_disp] = defn
             else:
