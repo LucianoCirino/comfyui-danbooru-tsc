@@ -29,23 +29,9 @@ from ..core.tagfmt import to_display_tag, split_character_trigger
 # Tool specs (search.* + the terminal submit_answer)
 # ---------------------------------------------------------------------------
 
-# Canonical focus-tag list (display form, lowercase + spaces). Anything outside
-# this set submitted by the model is treated as empty in _normalize_focus.
-FOCUS_TAGS: tuple[str, ...] = (
-    "ass focus", "food focus", "weapon focus", "plant focus", "foot focus",
-    "solo", "text focus", "book focus", "thigh focus", "hand focus",
-    "monster focus", "cloud focus", "footwear focus", "solo focus",
-    "armpit focus", "animal focus", "other focus", "eye focus",
-    "navel focus", "vehicle focus", "leg focus", "object focus",
-    "pectoral focus", "hip focus", "male focus", "back focus",
-    "clothes focus", "breast focus", "soft focus",
-)
-_FOCUS_TAG_SET: frozenset[str] = frozenset(FOCUS_TAGS)
-
-
 # Canonical character-count tag list (cast/quantity descriptors). Curated from
-# danbooru's character_count grouping with the focus-only tags stripped (they
-# live in the `focus` output) plus composition/meta noise removed.
+# danbooru's character_count grouping with focus-only tags and
+# composition/meta noise removed.
 CHARACTER_COUNT_TAGS: tuple[str, ...] = (
     "solo",
     "1girl", "2girls", "3girls", "4girls", "5girls", "6+girls", "multiple girls",
@@ -64,9 +50,9 @@ SUBMIT_ANSWER_SPEC = {
             "Call this exactly once when you have settled on the best matches. "
             "Pass the list of danbooru character keys the user implied (empty "
             "list if none), the list of danbooru artist keys (empty list if "
-            "none), and at most one image-focus tag (empty string if none "
-            "applies). Do NOT include generic descriptive tags — they are "
-            "handled by a different node downstream."
+            "none), and the character-count tags describing the cast. Do NOT "
+            "include generic descriptive tags — they are handled by a "
+            "different node downstream."
         ),
         "parameters": {
             "type": "object",
@@ -91,17 +77,6 @@ SUBMIT_ANSWER_SPEC = {
                         "explicitly asked to blend styles. Use [] if no artist "
                         "or style was named — empty is the correct answer "
                         "in that case."
-                    ),
-                },
-                "focus": {
-                    "type": "string",
-                    "enum": ("", *FOCUS_TAGS),
-                    "description": (
-                        "ONE image-focus tag from the predefined list (see "
-                        "system prompt for the list with definitions), or "
-                        "empty string if no focus tag clearly applies. Empty "
-                        "is the right answer when the user's request doesn't "
-                        "strongly center on a specific focus."
                     ),
                 },
                 "character_count": {
@@ -290,19 +265,6 @@ def run_agent(host: str,
 # ComfyUI node
 # ---------------------------------------------------------------------------
 
-def _normalize_focus(submitted: dict) -> str:
-    """Pull the focus field; accept empty string and only values from
-    FOCUS_TAGS. Tolerant of underscore vs space variants (some small
-    models emit `food_focus` despite the spec's enum). Anything that
-    doesn't match → empty."""
-    raw = (submitted.get("focus") or "").strip().lower()
-    if not raw:
-        return ""
-    # Convert underscores to spaces to match the canonical display form.
-    candidate = raw.replace("_", " ")
-    return candidate if candidate in _FOCUS_TAG_SET else ""
-
-
 def _normalize_character_count(submitted: dict) -> list[str]:
     """Pull the character_count field as a deduped list of valid tags.
     Tolerant of stringified comma-separated input, underscores, and case.
@@ -430,14 +392,13 @@ class DanbooruAgent:
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING")
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING")
     RETURN_NAMES = (
         "character_triggers",
         "character_series",
         "character_core_tags",
         "artist_triggers",
         "character_count",
-        "focus",
         "all_tags",
         "debug_info",
     )
@@ -456,7 +417,7 @@ class DanbooruAgent:
                 "Add a 'Danbooru DB Build' node and run it once, "
                 "or run build_db.py from the pack folder."
             )
-            return ("", "", "", "", "", "", "", err)
+            return ("", "", "", "", "", "", err)
 
         if isinstance(model, dict):
             host = model.get("host", "localhost")
@@ -467,7 +428,7 @@ class DanbooruAgent:
         if not _server_alive(host, port):
             err = (f"llama.cpp server not reachable at {host}:{port}. "
                    "Add a LlamaCpp Load Model or LlamaCpp External Server node first.")
-            return ("", "", "", "", "", "", "", err)
+            return ("", "", "", "", "", "", err)
 
         start = time.time()
         submitted, transcript = run_agent(
@@ -503,7 +464,6 @@ class DanbooruAgent:
         char_core_tags: list[str] = []
         art_triggers: list[str] = []
         char_count_tags: list[str] = []
-        focus: str = ""
         resolved_char_rows: list[tuple[str, dict | None]] = []
         resolved_art_rows: list[tuple[str, dict | None]] = []
 
@@ -511,7 +471,6 @@ class DanbooruAgent:
             chosen_char_keys = _normalize_keys(submitted, "characters", "character")
             chosen_art_keys = _normalize_keys(submitted, "artists", "artist")
             char_count_tags = _normalize_character_count(submitted)
-            focus = _normalize_focus(submitted)
 
             for key in chosen_char_keys:
                 row = searchmod.lookup_character(key)
@@ -553,7 +512,7 @@ class DanbooruAgent:
 
         # `all_tags`: everything flattened into one comma-separated monolith,
         # ordered Anima-style: count → char+series interleaved → artists →
-        # focus → core_tags. Per-character name/series stay adjacent
+        # core_tags. Per-character name/series stay adjacent
         # (character_triggers and character_series align by index).
         monolith_parts: list[str] = []
         if character_count:
@@ -566,8 +525,6 @@ class DanbooruAgent:
         for art in art_triggers:
             if art:
                 monolith_parts.append(art)
-        if focus:
-            monolith_parts.append(focus)
         for core_line in char_core_tags:
             if core_line:
                 monolith_parts.append(core_line)
@@ -597,7 +554,6 @@ class DanbooruAgent:
             else:
                 lines.append(f"  '{key}' -> NOT FOUND in DB")
         lines.append(f"character_count: '{character_count}'")
-        lines.append(f"focus: '{focus}'")
         lines.append("")
         lines.append("--- transcript ---")
         for i, turn in enumerate(transcript):
@@ -627,7 +583,6 @@ class DanbooruAgent:
             character_core_tags,
             artist_triggers,
             character_count,
-            focus,
             all_tags,
             debug_info,
         )
