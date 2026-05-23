@@ -11,7 +11,7 @@ import re
 import time
 
 from ..core import db as dblayer
-from ..core.tagfmt import split_character_trigger
+from ..core.tagfmt import split_character_trigger, unescape_parens
 
 
 class DanbooruCharacterMatcher:
@@ -173,8 +173,12 @@ class DanbooruCharacterMatcher:
             debug_lines.append(f"\n... and {len(matches) - 20} more candidates ({remaining_prob:.1f}% combined)")
 
         # Split the DB trigger ("hatsune miku, vocaloid") into name + series so
-        # the matcher's outputs line up with the extractor's shape.
-        char_disp, series_disp = split_character_trigger(selected["trigger"] or "")
+        # the matcher's outputs line up with the extractor's shape. DB triggers
+        # are stored ComfyUI-escaped (``\(fate\)``); strip the escaping so this
+        # node emits raw parens, matching the extractor.
+        char_disp, series_disp = split_character_trigger(
+            unescape_parens(selected["trigger"] or "")
+        )
 
         return (
             char_disp,

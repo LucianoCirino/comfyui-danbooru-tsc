@@ -28,6 +28,10 @@ _PAREN_GROUP = re.compile(r"(?<!\\)\(([^()]*)\)")
 # apply the underscore→space rule ONLY to the raw segments.
 _ESCAPED_REGION = re.compile(r"(\\\([^()]*\\\))")
 
+# A backslash-escaped paren (``\(`` or ``\)``) as produced by
+# ``escape_for_comfy`` or stored pre-escaped in the DB trigger field.
+_ESCAPED_PAREN = re.compile(r"\\([()])")
+
 
 def to_display_tag(tag: str) -> str:
     """Render a DB tag in display/prompt form.
@@ -78,6 +82,17 @@ def escape_for_comfy(tag: str) -> str:
     out = "".join(parts)
 
     return re.sub(r" {2,}", " ", out).strip()
+
+
+def unescape_parens(tag: str) -> str:
+    """Strip ComfyUI paren-escaping: ``fate \\(series\\)`` → ``fate (series)``.
+
+    Inverse of the paren half of :func:`escape_for_comfy`. The DB stores
+    character/artist triggers pre-escaped (``artoria pendragon \\(fate\\)``);
+    consumers that re-apply their own escaping downstream want the raw form.
+    Tags with no escaped parens pass through unchanged.
+    """
+    return _ESCAPED_PAREN.sub(r"\1", tag)
 
 
 def split_character_trigger(trigger: str) -> tuple[str, str]:

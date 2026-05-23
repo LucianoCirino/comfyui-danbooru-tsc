@@ -22,7 +22,7 @@ import urllib.request
 from ..core import db as dblayer
 from ..core import search as searchmod
 from ..core import prompts as promptlib
-from ..core.tagfmt import to_display_tag, split_character_trigger
+from ..core.tagfmt import to_display_tag, split_character_trigger, unescape_parens
 
 
 # ---------------------------------------------------------------------------
@@ -73,10 +73,10 @@ SUBMIT_ANSWER_SPEC = {
                     "description": (
                         "Exact danbooru artist keys the user named or clearly "
                         "implied, e.g. ['ebifurya'] or ['wlop', 'sakimichan']. "
-                        "Usually zero or one; only return multiple if the user "
-                        "explicitly asked to blend styles. Use [] if no artist "
-                        "or style was named — empty is the correct answer "
-                        "in that case."
+                        "There may be zero, one, or several — include every "
+                        "artist the user named, not just the first. Use [] if "
+                        "no artist or style was named — empty is the correct "
+                        "answer in that case."
                     ),
                 },
                 "character_count": {
@@ -483,7 +483,12 @@ class DanbooruAgent:
                     char_series.append("")
                     char_core_tags.append("")
                     continue
-                char_disp, series_disp = split_character_trigger(row.get("trigger") or "")
+                # DB triggers are stored ComfyUI-escaped (``\(fate\)``); strip
+                # the escaping here so this node emits raw parens — the user
+                # re-applies escaping in a downstream node.
+                char_disp, series_disp = split_character_trigger(
+                    unescape_parens(row.get("trigger") or "")
+                )
                 # Fall back to deriving display names from the keys if the
                 # trigger field was missing/oddly shaped.
                 if not char_disp:
@@ -498,7 +503,7 @@ class DanbooruAgent:
                 arow = searchmod.lookup_artist(key)
                 resolved_art_rows.append((key, arow))
                 if arow:
-                    art_triggers.append(arow.get("trigger") or "")
+                    art_triggers.append(unescape_parens(arow.get("trigger") or ""))
                 else:
                     art_triggers.append("")
 
